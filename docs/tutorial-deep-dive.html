@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TTL, Replication, and the Future: Part 3 of 3</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="hero">
+    <h1><span>TTL, Replication,</span> and the Future</h1>
+    <p class="subtitle">Part 3 of 3: The nitty-gritty details: how TTLs propagate through the entire pipeline, how replicas behave, and the corner cases that tripped us up.</p>
+    <div class="meta-badges">
+        <span class="badge">TTL</span>
+        <span class="badge">Replication</span>
+        <span class="badge">Valkey Module</span>
+    </div>
+</div>
+
+<div class="container">
+
+<nav class="series-nav">
+    <a href="tutorial.html">Part 1: Introduction</a>
+    <a href="tutorial-architecture.html">Part 2: Building It</a>
+    <a href="tutorial-deep-dive.html" class="active">Part 3: TTL, Replication & Future</a>
+</nav>
+
+<nav class="toc">
+    <h3>Contents</h3>
+    <ol>
+        <li><a href="#ttl">TTL support</a></li>
+        <li><a href="#replication">Replication</a></li>
+        <li><a href="#corner-cases">Corner cases and gotchas</a></li>
+        <li><a href="#whats-left">What's left</a></li>
+        <li><a href="#conclusion">Conclusion</a></li>
+    </ol>
+</nav>
+
+<!-- ===================================================================== -->
+<h2 id="ttl">TTL Support</h2>
+
+<p>Keys with a TTL in Valkey have that TTL propagated through the entire pipeline: captured at write time, stored in the backend, filtered on read-through, and restored when populating the cache.</p>
+
+<h3>Capturing TTL at write time</h3>
+
+<p>When the keyspace event handler fires on a SET, it calls <span class="inline-code">PTTL</span> on the key to get the remaining TTL in milliseconds. If positive, it computes an absolute Unix epoch expiry (seconds) by adding the remaining time to the current time. This absolute form is what gets stored in the backend.</p>
+
+<p>Why <span class="inline-code">PTTL</span> instead of <span class="inline-code">EXPIRETIME</span>? <span class="inline-code">PTTL</span> has been available since Valkey's earliest releases, while <span class="inline-code">EXPIRETIME</span> requires 7.0+. We round up to seconds since both sinks store seconds.</p>
+
+<h3>Storage format</h3>
+
+<p>Each backend stores the TTL differently, both with zero overhead:</p>
+
+<table>
+    <thead>
+        <tr><th>Backend</th><th>Storage</th><th>Format</th></tr>
+    </thead>
+    <tbody>
+        <tr><td>DynamoDB</td><td><span class="inline-code">ttl</span> attribute</td><td><span class="inline-code">{"N": "1700000000"}</span> (epoch seconds)</td></tr>
+        <tr><td>S3 Express</td><td><span class="inline-code">x-amz-meta-expires-at</span> header</td><td>Object metadata header (epoch seconds)</td></tr>
+    </tbody>
+</table>
+
+<p>DynamoDB: the <span class="inline-code">ttl</span> attribute is a Number. When present, it can also be configured as DynamoDB's native TTL attribute for automatic background cleanup by the service itself. When absent (no-TTL keys), the attribute is simply omitted.</p>
+
+<p>S3 Express: the TTL is stored as a custom metadata header on the object. S3 metadata headers are included in PUT/GET requests at no extra cost or latency. No body format change means full backward compatibility with existing objects (they just have no TTL metadata, which is treated as "no expiry").</p>
+
+<h3>Filtering on read-through</h3>
+
+<p><span class="inline-code">SINK.GET</span> never serves expired data. Three layers of TTL filtering ensure this, even when the backend hasn't cleaned up yet:</p>
+
+<ol>
+    <li><strong>Backend-side (sink <span class="inline-code">lookup()</span>):</strong> Both the S3 and DynamoDB sink implementations check <span class="inline-code">now >= expires_at</span> immediately after reading the response. If the item is expired, <span class="inline-code">lookup()</span> returns <span class="inline-code">None</span>. The expired data is never sent back to the caller. This catches the common case where the backend still has the item (DynamoDB's native TTL cleanup can lag up to 48 hours; S3 has no automatic expiry at all).</li>
+    <li><strong>Bridging thread (readthrough.rs):</strong> Even if the sink returns a value, the <span class="inline-code">SINK.GET</span> bridging thread rechecks expiry before doing anything with it. Time may have elapsed between the backend read and the thread receiving the result. If <span class="inline-code">now >= expires_at</span>, the thread returns <span class="inline-code">Null</span> to the client and does not populate the cache:
+
+<pre><code><span class="keyword">if let</span> <span class="type">Some</span>(exp) = expires_at {
+    <span class="keyword">if</span> now_secs >= exp {
+        <span class="comment">// Data is expired — don't populate cache, return nil.</span>
+        thread_ctx.reply(<span class="type">Ok</span>(<span class="type">ValkeyValue</span>::Null));
+        <span class="keyword">return</span>;
+    }
+}</code></pre>
+    </li>
+    <li><strong>Cache populate guard:</strong> After the expiry check passes, the bridging thread computes <span class="inline-code">remaining = expires_at - now</span>. If this drops to zero during processing (race between check and SET), the thread skips the SET and returns <span class="inline-code">Null</span>. This prevents caching a value with zero or negative TTL.</li>
+</ol>
+
+<p>The net effect: <span class="inline-code">SINK.GET</span> is a strict TTL filter. Even if the backend stores stale data indefinitely, the client never sees it.</p>
+
+<h3>Cache populate with TTL</h3>
+
+<p>When populating the local cache from a read-through result, the remaining TTL is computed as <span class="inline-code">expires_at - now</span>. If positive, the cache is populated with <span class="inline-code">SET key value EX remaining</span>. If zero or negative (expired during processing), the value is not cached and nil is returned.</p>
+
+<div class="highlight-box">
+    <p><strong>DynamoDB native TTL.</strong> If you configure the <span class="inline-code">ttl</span> attribute as DynamoDB's TTL attribute (<span class="inline-code">aws dynamodb update-time-to-live --table-name ... --time-to-live-specification Enabled=true,AttributeName=ttl</span>), DynamoDB will automatically delete expired items in the background. This keeps the table clean without any application-side logic. The module's read-side filtering ensures expired items are never served even before DynamoDB's background cleanup runs (which can have up to 48 hours of delay).</p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="replication">Replication</h2>
+
+<p>Valkey supports primary-replica replication. On replicas, write-behind should be disabled (the primary handles persistence), but read-through should still work (replicas can serve cached data from the backend).</p>
+
+<h3>Role detection</h3>
+
+<p>The module tracks the current role in a static <span class="inline-code">AtomicBool</span>:</p>
+
+<pre><code><span class="keyword">static</span> IS_PRIMARY: <span class="type">AtomicBool</span> = <span class="type">AtomicBool</span>::new(<span class="keyword">false</span>);
+
+<span class="comment">// Fires on failover/promotion via distributed_slice.</span>
+<span class="macro">#[distributed_slice(ROLE_CHANGED_SERVER_EVENTS_LIST)]</span>
+<span class="keyword">fn</span> <span class="function">on_role_changed</span>(_ctx: &<span class="type">Context</span>, new_role: <span class="type">ServerRole</span>) {
+    IS_PRIMARY.store(new_role == <span class="type">ServerRole</span>::Primary, <span class="type">Ordering</span>::Relaxed);
+}</code></pre>
+
+<h3>Subscribe-then-check ordering</h3>
+
+<p>The <span class="inline-code">valkey_module!</span> macro calls <span class="inline-code">register_server_events()</span> <em>before</em> <span class="inline-code">init()</span>. This means the role-change event handler is subscribed before the module first checks the current role in <span class="inline-code">init()</span>. There is no window where a role change could be missed. The initial role is read from <span class="inline-code">ctx.get_flags().contains(ContextFlags::MASTER)</span> in <span class="inline-code">init()</span>.</p>
+
+<h3>What happens on replicas</h3>
+
+<ul>
+    <li><strong>Write-behind disabled:</strong> The keyspace event handler returns immediately when <span class="inline-code">!IS_PRIMARY</span>. No writes are enqueued to the channel, no backend writes occur.</li>
+    <li><strong>SINK.GET works normally:</strong> Read-through still queries the backends and returns the value to the client.</li>
+    <li><strong>Cache populate fails silently:</strong> The SET to populate the local cache returns <span class="inline-code">READONLY</span> on replicas. The <span class="inline-code">let _ = guard.call("SET", ...)</span> silently ignores this. The client still gets the value from the backend.</li>
+</ul>
+
+<h3>Data loss window</h3>
+
+<p>If the primary crashes, up to one debounce window (default 1 second) of writes may be lost. This is the same tradeoff as any write-behind system. The replica, if promoted, begins accepting writes and persisting them from that point forward.</p>
+
+<div class="warning-box">
+    <p><strong>SINK.GET on replicas does not cache.</strong> Because the SET to populate the cache fails with READONLY, every SINK.GET on a replica hits the backend. This is by design: replicas should not have independent caches that diverge from the primary. If SINK.GET read-through latency on replicas is a concern, consider using <span class="inline-code">READONLY</span> mode in your client library to route reads to the primary.</p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="corner-cases">Corner Cases and Gotchas</h2>
+
+<h3>@STRING vs @SET</h3>
+
+<p>The <span class="inline-code">valkey_module!</span> macro's event handler registration uses <span class="inline-code">@</span> prefixes for event types. <span class="inline-code">@SET</span> does not mean the SET command. It means the Set data type (SADD, SREM, SPOP). The correct subscription for string SET commands is <span class="inline-code">@STRING</span>.</p>
+
+<pre><code><span class="comment">// WRONG: subscribes to Set data type events (SADD, etc.)</span>
+<span class="keyword">event_handlers</span>: [
+    [<span class="macro">@SET</span>: keyspace_event_handler]
+],
+
+<span class="comment">// CORRECT: subscribes to string commands (SET, SETEX, etc.)</span>
+<span class="keyword">event_handlers</span>: [
+    [<span class="macro">@STRING</span>: keyspace_event_handler]
+],</code></pre>
+
+<p>This was discovered during live testing when <span class="inline-code">writes_coalesced</span> stayed at 0 despite keyspace notifications being enabled.</p>
+
+<h3>Auto-enabling keyspace notifications</h3>
+
+<p>Valkey defaults <span class="inline-code">notify-keyspace-events</span> to an empty string. Without the K$ flags, the module's event handler will never fire. The module auto-enables these during init, reading the current config and preserving existing flags:</p>
+
+<span class="file-ref">crates/sink/src/lib.rs:131-154</span>
+<pre><code><span class="keyword">if</span> !current.contains(<span class="string">'K'</span>) || !current.contains(<span class="string">'$'</span>) {
+    <span class="keyword">let mut</span> flags = current.clone();
+    <span class="keyword">if</span> !flags.contains(<span class="string">'K'</span>) { flags.push(<span class="string">'K'</span>); }
+    <span class="keyword">if</span> !flags.contains(<span class="string">'$'</span>) { flags.push(<span class="string">'$'</span>); }
+    <span class="keyword">let</span> _ = ctx.call(<span class="string">"CONFIG"</span>, &[<span class="string">"SET"</span>, <span class="string">"notify-keyspace-events"</span>, &flags]);
+}</code></pre>
+
+<!-- ===================================================================== -->
+<h2 id="whats-left">What's Left</h2>
+
+<p>No project is ever truly done. Here are the gaps we know about. If any of them sound interesting to you, they'd each make a great first contribution.</p>
+
+<h3>DEL propagation</h3>
+<p>DEL commands are not captured. When a key is deleted from Valkey, it remains in the backend (DynamoDB or S3) indefinitely. The fix would be to subscribe to <span class="inline-code">del</span> and <span class="inline-code">expired</span> events in the keyspace handler and send a new message type (e.g. <span class="inline-code">KeyDeleted</span>) to the background runtime, which would call <span class="inline-code">DeleteObject</span> or <span class="inline-code">DeleteItem</span> on the sinks. For S3, consider using S3 lifecycle rules as a simpler alternative for eventual cleanup.</p>
+
+<h3>Binary value fidelity in read-through</h3>
+<p>The read-through path in <span class="inline-code">readthrough.rs</span> replies with <span class="inline-code">ValkeyValue::StringBuffer(value)</span> (binary-safe), but earlier versions used <span class="inline-code">String::from_utf8_lossy</span>. While the current reply path is binary-safe, any logging or debugging code that converts values to strings should be audited to ensure non-UTF8 binary values are not silently corrupted.</p>
+
+<h3>Integration tests</h3>
+<p>All 96 tests are unit tests. There are no integration tests against a running Valkey server, real AWS endpoints, or even LocalStack. The unit tests are thorough (they cover coalescing edge cases, config parsing, base64 roundtrips, XML parsing, circuit breaker state machines, retry logic) but they cannot test the end-to-end flow: module load, SET, keyspace event, coalesce, flush, SINK.GET, read-through, cache populate.</p>
+
+<h3>Sanity test refactoring</h3>
+<p><span class="inline-code">tools/loadtest/src/main.rs</span> is 1,305 lines in a single file. It handles Docker management, configuration parsing, burst testing, sustained testing, metrics collection, and output formatting. This should be split into modules (e.g. <span class="inline-code">config.rs</span>, <span class="inline-code">docker.rs</span>, <span class="inline-code">burst.rs</span>, <span class="inline-code">sustained.rs</span>, <span class="inline-code">util.rs</span>) for maintainability. (Despite the directory name, these are low-load sanity tests, not production load tests.)</p>
+
+<h3>Release profile optimization</h3>
+<p>The workspace <span class="inline-code">Cargo.toml</span> has no <span class="inline-code">[profile.release]</span> section. Adding LTO (<span class="inline-code">lto = true</span>), <span class="inline-code">codegen-units = 1</span>, and <span class="inline-code">strip = true</span> would produce a smaller, faster binary at the cost of longer compile times. For a module loaded once at server startup, this tradeoff is almost always worth it.</p>
+
+<h3>ConfigDelta wiring</h3>
+<p>The <span class="inline-code">ConfigUpdate(ConfigDelta)</span> message type exists in <span class="inline-code">channel.rs</span>, the background loop handles it in <span class="inline-code">background.rs</span> (with <span class="inline-code">apply_config_delta</span> supporting debounce, size threshold, and read-through toggling), but no code path ever <em>sends</em> a ConfigUpdate message. The <span class="inline-code">#[allow(dead_code)]</span> on the enum confirms this. To wire it up, the module would need to register a <span class="inline-code">CONFIG SET</span> handler (or a custom command like <span class="inline-code">SINK.CONFIG</span>) that creates and sends the appropriate <span class="inline-code">ConfigDelta</span> variants.</p>
+
+<h3>Credential refresh error handling</h3>
+<p>The <span class="inline-code">RefreshableCredentials</span> provider in <span class="inline-code">aws.rs</span> refreshes from environment variables. If the environment variables are removed or changed while the module is running (e.g. rotated IAM credentials on an EC2 instance), the refresh will fail with a hard error. Consider falling back to IMDS (Instance Metadata Service) for EC2 environments, or at minimum logging a warning when env-based refresh fails after previously succeeding.</p>
+
+<h3>Zero-copy keyspace access</h3>
+<p>The keyspace event handler currently calls <span class="inline-code">GET</span> to fetch the value after every <span class="inline-code">SET</span>, then clones the bytes into a <span class="inline-code">Vec&lt;u8&gt;</span> for the channel message. The same clone happens on the read-through path when populating the cache. The Valkey Module API exposes <span class="inline-code">ValkeyModule_OpenKey</span> + <span class="inline-code">ValkeyModule_StringDMA</span>, which returns a direct pointer to the key's internal string buffer without copying. Using DMA access in the event handler would eliminate one allocation and one memcpy per write. On the read-through side, <span class="inline-code">ValkeyModule_StringSet</span> with a pre-allocated buffer could avoid the intermediate <span class="inline-code">Vec</span>. For high-throughput workloads with large values, this could meaningfully reduce memory pressure and improve cache-line efficiency on the main thread.</p>
+
+<!-- ===================================================================== -->
+<h2 id="conclusion">Conclusion</h2>
+
+<p>Over the course of this series, we built a transparent write-behind and read-through persistence layer for Valkey in roughly 2,700 lines of Rust. No SDK bloat, no external sidecars, no changes to application code beyond swapping <span class="inline-code">GET</span> for <span class="inline-code">SINK.GET</span>.</p>
+
+<p>The key wins:</p>
+
+<ul>
+    <li><strong>Zero main-thread impact.</strong> Every network call happens on background threads. The keyspace event handler does a lock-free <span class="inline-code">try_send</span> and returns in nanoseconds. Valkey's single-threaded event loop never stalls.</li>
+    <li><strong>Size-based routing.</strong> Small values go to DynamoDB for its per-WCU pricing advantage. Large values go to S3 Express for its flat per-request cost. The router makes this invisible to the application.</li>
+    <li><strong>TTL fidelity.</strong> Expiry times propagate through the entire pipeline: captured at write time, stored in the backend, filtered on read-through, and restored when populating the cache. Expired data is never served, even when the backend hasn't cleaned up yet.</li>
+    <li><strong>Replica awareness.</strong> Write-behind runs on primaries only. Replicas do read-through but don't duplicate writes. Role changes are detected via <span class="inline-code">distributed_slice</span> event handlers registered before <span class="inline-code">init()</span>, so there is no window where a failover could be missed.</li>
+</ul>
+
+<p>But the module itself isn't really the point. The <strong>module system</strong> is the takeaway. Valkey is extensible in ways that most people don't realize. A shared library loaded at startup gets the same in-process performance as built-in commands, full access to the keyspace, and the ability to offload arbitrary async work to background threads. The patterns in valkey-sink (crossbeam channels for non-blocking dispatch, BlockClient for async read-through, <span class="inline-code">distributed_slice</span> for event subscription, <span class="inline-code">ThreadSafeContext</span> for bridging async to sync) apply to any module you might build: CDC pipelines, custom data structures, real-time analytics, domain-specific caching, audit logging.</p>
+
+<p>If you want to get started, the path is short:</p>
+
+<ol>
+    <li>Clone the <a href="https://github.com/valkey-io/valkeymodule-rs">valkeymodule-rs</a> repo and build <a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/hello.rs">hello.rs</a>. Two minutes to a working module.</li>
+    <li>Subscribe to a keyspace event. Now you can react to writes as they happen.</li>
+    <li>Add a background thread for async work. Now you can do anything without blocking the event loop.</li>
+</ol>
+
+<p>That's the whole surface area. Fork the repo, break something, fix it, and build something that doesn't exist yet. The Valkey module ecosystem is still young, and there is a lot of room to build.</p>
+
+<hr>
+
+<div class="bottom-nav">
+    <a href="tutorial-architecture.html">&larr; Part 2: Building It</a>
+    <a href="tutorial.html">Back to Part 1 &rarr;</a>
+</div>
+
+</div>
+
+<div class="footer">
+    <p>Part 3 of 3 &middot; Built with <a href="https://github.com/valkey-io/valkeymodule-rs">valkeymodule-rs</a></p>
+</div>
+
+</body>
+</html>

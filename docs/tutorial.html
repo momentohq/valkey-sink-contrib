@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Introduction to Valkey Modules: Part 1 of 3</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="hero">
+    <h1>Introduction to <span>Valkey</span> Modules</h1>
+    <p class="subtitle">Part 1 of 3: What modules are, why they exist, how to write one in Rust, and how to get started with your first module.</p>
+    <div class="meta-badges">
+        <span class="badge">Rust</span>
+        <span class="badge">Valkey Module</span>
+    </div>
+</div>
+
+<div class="container">
+
+<nav class="series-nav">
+    <a href="tutorial.html" class="active">Part 1: Introduction</a>
+    <a href="tutorial-architecture.html">Part 2: Building It</a>
+    <a href="tutorial-deep-dive.html">Part 3: TTL, Replication & Future</a>
+</nav>
+
+<nav class="toc">
+    <h3>Contents</h3>
+    <ol>
+        <li><a href="#valkey-modules">What are Valkey modules?</a></li>
+        <li><a href="#rust-modules">Writing Valkey modules in Rust</a></li>
+        <li><a href="#go-build">Go build your own</a></li>
+    </ol>
+</nav>
+
+<!-- ===================================================================== -->
+<h2 id="valkey-modules">What Are Valkey Modules?</h2>
+
+<p><a href="https://valkey.io">Valkey</a> is an open-source in-memory data store maintained by the Linux Foundation. One of its most powerful features is <strong>loadable modules</strong>: shared libraries (<span class="inline-code">.so</span> on Linux, <span class="inline-code">.dylib</span> on macOS) that extend the server with custom commands, custom data types, and event handlers. If you've ever wished Valkey had a feature it doesn't, modules are how you add it.</p>
+
+<p>Modules run <strong>in-process</strong> with the server. They share the same address space, can call native Valkey commands (GET, SET, PTTL, CONFIG) as local function calls, and can subscribe to keyspace notifications. This is fundamentally different from an external sidecar process that connects over TCP: there is zero network hop for internal operations, and command execution completes in nanoseconds rather than microseconds. That means your custom logic runs at the same speed as built-in Valkey commands.</p>
+
+<h3>Why modules instead of external processes?</h3>
+
+<p>Before we get into the details, it's worth understanding why we chose the module approach at all. There are three ways to extend Valkey with custom logic, and the tradeoffs are significant:</p>
+
+<table>
+    <thead>
+        <tr><th>Approach</th><th>Read latency</th><th>Write overhead</th><th>Deployment</th></tr>
+    </thead>
+    <tbody>
+        <tr><td>External sidecar</td><td>Network RTT (~100us+)</td><td>Two hops per write</td><td>Separate process</td></tr>
+        <tr><td>Lua script</td><td>In-process, but interpreted</td><td>No async I/O</td><td>Loaded per-connection</td></tr>
+        <tr><td>Module (.so)</td><td>In-process, native speed</td><td>Zero-copy keyspace access</td><td>Loaded once at startup</td></tr>
+    </tbody>
+</table>
+
+<p>For a write-behind persistence system, the module approach is the clear winner. Keyspace events are delivered synchronously in the same thread as the SET command. The value can be read via a local GET call in nanoseconds. And the only network I/O (to S3 or DynamoDB) happens asynchronously on background threads. An external sidecar would need to subscribe to keyspace notifications over a TCP connection, adding latency and a failure mode on every single write. A Lua script can't do async I/O at all.</p>
+
+<div class="highlight-box">
+    <p><strong>Notable Valkey modules for context.</strong> <a href="https://github.com/valkey-io/valkey-bloom">valkey-bloom</a> (bloom filters), <a href="https://github.com/valkey-io/valkey-json">valkey-json</a> (JSON document storage), <a href="https://github.com/valkey-io/valkey-search">valkey-search</a> (full-text and vector search). All follow the same pattern: a C-compatible shared library loaded via <span class="inline-code">MODULE LOAD</span> or <span class="inline-code">--loadmodule</span>. valkey-sink is smaller and more focused: two commands, one event subscription, ~2,700 lines. The point is: you don't need to build something massive. A focused module that does one thing well is the sweet spot.</p>
+</div>
+
+<h3>Key concepts</h3>
+
+<p>If you haven't worked with Valkey modules before, here are the four building blocks you'll see throughout this article:</p>
+
+<ul>
+    <li><strong>Context</strong> (<span class="inline-code">&Context</span>): the handle to the running Valkey server. Every command handler and event handler receives a Context, through which it can call native commands, read server flags, block clients, and log messages.</li>
+    <li><strong>Commands</strong>: functions registered at module load time. They have a name (e.g. <span class="inline-code">SINK.GET</span>), a handler function, and metadata about which arguments are keys (for cluster routing). When a client sends the command, Valkey dispatches to the handler.</li>
+    <li><strong>Keyspace notifications</strong>: event subscriptions. A module can register a handler that fires on every string write (<span class="inline-code">@STRING</span>), every set operation (<span class="inline-code">@SET</span>), every expired key (<span class="inline-code">@EXPIRED</span>), etc. The handler receives the event type, the event name (e.g. "set"), and the key bytes.</li>
+    <li><strong>BlockClient</strong>: an API that lets a command handler suspend the client without blocking the event loop. The client is put on hold, the event loop continues serving other clients, and a background thread or task eventually calls <span class="inline-code">ThreadSafeContext::reply()</span> to unblock the client with a response.</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="rust-modules">Writing Valkey Modules in Rust</h2>
+
+<p>The <a href="https://github.com/valkey-io/valkeymodule-rs"><span class="inline-code">valkeymodule-rs</span></a> crate (published as <span class="inline-code">valkey-module</span> on crates.io) provides safe Rust bindings for the Valkey Module API. It handles the unsafe C FFI, memory management, and type conversions so you can write idiomatic Rust without touching raw pointers. The barrier to entry is genuinely low. If you can write a Rust function, you can write a Valkey command.</p>
+
+<h3>Learning from the examples</h3>
+
+<p>The best way to get started is the <a href="https://github.com/valkey-io/valkeymodule-rs/tree/main/examples">examples directory</a> in valkeymodule-rs. It contains 36 standalone examples that cover nearly every module API surface:</p>
+
+<table>
+    <thead>
+        <tr><th>Example</th><th>What it demonstrates</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/hello.rs">hello.rs</a></td><td>The minimal starting point: a single custom command in ~20 lines</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/block.rs">block.rs</a></td><td>BlockClient for non-blocking async work (same pattern valkey-sink uses for SINK.GET)</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/threads.rs">threads.rs</a></td><td>Spawning background threads from command handlers with ThreadSafeContext</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/data_type.rs">data_type.rs</a></td><td>Defining a custom Valkey data type with serialization and RDB persistence</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/events.rs">events.rs</a></td><td>Subscribing to keyspace notifications</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/server_events.rs">server_events.rs</a></td><td>Handling server lifecycle events (role changes, config changes)</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/configuration.rs">configuration.rs</a></td><td>Registering module-level CONFIG parameters</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/stream.rs">stream.rs</a></td><td>Working with Valkey Streams from a module</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/acl.rs">acl.rs</a></td><td>ACL integration for fine-grained access control</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/timer.rs">timer.rs</a></td><td>Module-level timers for periodic tasks</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/expire.rs">expire.rs</a></td><td>Programmatic key expiration management</td></tr>
+        <tr><td><a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/scan_keys.rs">scan_keys.rs</a></td><td>Iterating over the keyspace from within a module</td></tr>
+    </tbody>
+</table>
+
+<p>Each example is a self-contained module you can build and load: <span class="inline-code">cargo build --example hello</span>, then <span class="inline-code">valkey-server --loadmodule ./target/debug/examples/libhello.so</span>. Pick an example close to what you want to build, read it, modify it, and you'll have a working module in minutes.</p>
+
+<h3>The <span class="inline-code">valkey_module!</span> macro</h3>
+
+<p>Every Valkey module written in Rust uses this macro as its entry point. It generates the C-compatible <span class="inline-code">ValkeyModule_OnLoad</span> function that Valkey expects, registers commands, event handlers, and the custom allocator. Here is a minimal "hello world" module:</p>
+
+<pre><code><span class="keyword">use</span> valkey_module::{
+    alloc::<span class="type">ValkeyAlloc</span>, valkey_module,
+    <span class="type">Context</span>, <span class="type">ValkeyResult</span>, <span class="type">ValkeyString</span>, <span class="type">ValkeyValue</span>, <span class="type">Status</span>,
+};
+
+<span class="keyword">fn</span> <span class="function">init</span>(_ctx: &<span class="type">Context</span>, _args: &[<span class="type">ValkeyString</span>]) -> <span class="type">Status</span> {
+    <span class="type">Status</span>::Ok
+}
+
+<span class="keyword">fn</span> <span class="function">hello_command</span>(_ctx: &<span class="type">Context</span>, _args: <span class="type">Vec</span>&lt;<span class="type">ValkeyString</span>&gt;) -> <span class="type">ValkeyResult</span> {
+    <span class="type">Ok</span>(<span class="type">ValkeyValue</span>::SimpleStringStatic(<span class="string">"hello from Rust!"</span>))
+}
+
+<span class="macro">valkey_module!</span> {
+    name: <span class="string">"hello"</span>,
+    version: <span class="number">1</span>,
+    allocator: (<span class="type">ValkeyAlloc</span>, <span class="type">ValkeyAlloc</span>),
+    data_types: [],
+    init: init,
+    commands: [
+        [<span class="string">"HELLO.SAY"</span>, hello_command, <span class="string">"readonly"</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>],
+    ],
+    event_handlers: [],
+}</code></pre>
+
+<p>Build it with <span class="inline-code">cargo build --release</span>, load it with <span class="inline-code">valkey-server --loadmodule ./target/release/libhello.so</span>, and call <span class="inline-code">HELLO.SAY</span> from any client.</p>
+
+<h3>How commands work</h3>
+
+<p>Every command handler has the signature <span class="inline-code">fn(ctx: &Context, args: Vec&lt;ValkeyString&gt;) -> ValkeyResult</span>. The first element of <span class="inline-code">args</span> is always the command name itself (e.g. <span class="inline-code">SINK.GET</span>). The return type <span class="inline-code">ValkeyResult</span> is <span class="inline-code">Result&lt;ValkeyValue, ValkeyError&gt;</span>. <span class="inline-code">ValkeyValue</span> has variants for strings, integers, arrays, nil, and <span class="inline-code">NoReply</span> (used with BlockClient).</p>
+
+<h3>How event handlers work</h3>
+
+<p>Event handlers are registered in the <span class="inline-code">event_handlers</span> array of the macro. The <span class="inline-code">@</span> prefix denotes the <strong>event type</strong>, not the command name:</p>
+
+<table>
+    <thead>
+        <tr><th>Subscription</th><th>Fires on</th><th>Common confusion</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><span class="inline-code">@STRING</span></td><td>SET, SETEX, SETNX, MSET, APPEND, ...</td><td>This is what you want for SET commands</td></tr>
+        <tr><td><span class="inline-code">@SET</span></td><td>SADD, SREM, SPOP, ...</td><td>NOT the SET command: this is the Set data type</td></tr>
+        <tr><td><span class="inline-code">@HASH</span></td><td>HSET, HDEL, ...</td><td>Hash data type operations</td></tr>
+        <tr><td><span class="inline-code">@EXPIRED</span></td><td>Key expiration events</td><td>Value is already gone by the time the handler fires</td></tr>
+    </tbody>
+</table>
+
+<h3>The allocator constraint</h3>
+
+<p>The <span class="inline-code">allocator: (ValkeyAlloc, ValkeyAlloc)</span> line tells Rust to use Valkey's built-in allocator (jemalloc, by default) for all heap allocations. This is essential: Valkey tracks memory usage across all modules, and using the system allocator would produce inaccurate <span class="inline-code">INFO memory</span> output. However, <span class="inline-code">ValkeyAlloc</span> requires a running Valkey server to function. For unit tests, the crate provides an <span class="inline-code">enable-system-alloc</span> feature flag that swaps in the standard system allocator:</p>
+
+<pre><code><span class="comment"># Unit tests use system allocator since ValkeyAlloc requires a running server</span>
+cargo test --features enable-system-alloc</code></pre>
+
+<h3>The crate type: <span class="inline-code">cdylib</span></h3>
+
+<p>The <span class="inline-code">Cargo.toml</span> must declare <span class="inline-code">crate-type = ["cdylib"]</span>. This tells the Rust compiler to produce a C-compatible dynamic library (<span class="inline-code">.so</span> / <span class="inline-code">.dylib</span>) instead of a Rust-native <span class="inline-code">.rlib</span>. Valkey's module loader expects a C ABI entry point.</p>
+
+<h3>The <span class="inline-code">linkme</span> crate and <span class="inline-code">distributed_slice</span></h3>
+
+<p>Server event handlers (like role-change notifications) are registered using the <span class="inline-code">linkme</span> crate's <span class="inline-code">#[distributed_slice]</span> attribute. This is a compile-time mechanism: the handler function is placed into a linker section, and the <span class="inline-code">valkey_module!</span> macro iterates over all entries in that section during module load. The key property is that <strong>event handlers are registered before <span class="inline-code">init()</span> runs</strong>, so there is no window where a role change could be missed.</p>
+
+<div class="warning-box">
+    <p><strong>The main thread is single-threaded and synchronous.</strong> You CANNOT <span class="inline-code">.await</span> anything on the Valkey main thread. Keyspace event handlers, command handlers, and init all run on this thread. Any async work (HTTP calls, file I/O, timers) must be offloaded to a background runtime. This constraint shapes the entire architecture of valkey-sink, and it's a good thing. Once you internalize it, the design of any Valkey module becomes straightforward: fast synchronous logic on the main thread, everything else in the background. The crossbeam channel, the bridging thread for BlockClient, and the separate tokio runtime all follow directly from this one rule.</p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="go-build">Go Build Your Own</h2>
+
+<p>If you've read this far, you know enough to build a Valkey module. Seriously. The entire surface area is:</p>
+
+<ol>
+    <li>A <span class="inline-code">valkey_module!</span> macro call that registers your commands and event handlers.</li>
+    <li>Command handlers: <span class="inline-code">fn(ctx: &Context, args: Vec&lt;ValkeyString&gt;) -> ValkeyResult</span>.</li>
+    <li>Event handlers: <span class="inline-code">fn(ctx: &Context, event_type: NotifyEvent, event: &str, key: &[u8])</span>.</li>
+    <li>One rule: don't block the main thread.</li>
+</ol>
+
+<p>That's it. Here's a concrete path to your first module:</p>
+
+<ol>
+    <li><strong>Clone the <a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/hello.rs">hello.rs</a> example.</strong> Build it, load it into a running Valkey server, call your command from <span class="inline-code">valkey-cli</span>. The whole loop takes about two minutes.</li>
+    <li><strong>Add a second command.</strong> Maybe one that reads a key and transforms the value. Now you have a module that does something useful.</li>
+    <li><strong>Subscribe to an event.</strong> The <a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/events.rs">events.rs</a> example shows how. Once you can react to writes as they happen, the design space opens up: audit logging, real-time streaming, change data capture, custom replication. All become straightforward.</li>
+    <li><strong>Need async work?</strong> Look at <a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/block.rs">block.rs</a> and <a href="https://github.com/valkey-io/valkeymodule-rs/blob/main/examples/threads.rs">threads.rs</a> for the BlockClient + ThreadSafeContext pattern. valkey-sink uses exactly this pattern for SINK.GET read-through.</li>
+</ol>
+
+<p>The <a href="https://github.com/valkey-io/valkeymodule-rs">valkeymodule-rs repository</a> has 36 examples covering commands, data types, events, timers, ACLs, streams, configuration, and more. Between those examples and this walkthrough of a real-world module, you have everything you need.</p>
+
+<div class="highlight-box">
+    <p><strong>The Valkey module ecosystem is still young.</strong> There's a lot of low-hanging fruit: custom data structures, integrations with message queues, CDC pipelines, domain-specific caching strategies, observability hooks. If you build something interesting, the community would love to hear about it at <a href="https://github.com/valkey-io">github.com/valkey-io</a>.</p>
+</div>
+
+<div class="next-part-box">
+    <p>Ready to see these concepts in action? In Part 2, we walk through valkey-sink, a real-world module that adds write-behind persistence to Valkey with S3 Express and DynamoDB.</p>
+    <a href="tutorial-architecture.html" class="cta">Continue to Part 2: Building valkey-sink &rarr;</a>
+</div>
+
+</div>
+
+<div class="footer">
+    <p>Part 1 of 3 &middot; Built with <a href="https://github.com/valkey-io/valkeymodule-rs">valkeymodule-rs</a></p>
+</div>
+
+</body>
+</html>

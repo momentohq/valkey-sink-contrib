@@ -1,0 +1,21 @@
+[package]
+name = "valkey-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared utilities for Valkey modules: AWS SigV4, retry, metrics"
+license = "Apache-2.0"
+
+[dependencies]
+aws-sigv4 = "1"
+aws-credential-types = "1"
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+sha2 = "0.10"
+hex = "0.4"
+tokio = { version = "1", features = ["time"] }
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[features]
+enable-system-alloc = []

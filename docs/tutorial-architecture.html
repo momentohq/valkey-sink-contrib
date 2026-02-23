@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Putting It to Practice: Writing a Valkey Rust Module</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="hero">
+    <h1>Putting It to Practice: Writing a <span>Valkey Rust Module</span></h1>
+    <p class="subtitle">Part 2 of 3: From requirements to working code. The design of valkey-sink's write-behind persistence, and a guided tour of the codebase.</p>
+    <div class="meta-badges">
+        <span class="badge">S3 Express</span>
+        <span class="badge">DynamoDB</span>
+        <span class="badge">SigV4</span>
+        <span class="badge">Tokio</span>
+        <span class="badge">Valkey Module</span>
+    </div>
+</div>
+
+<div class="container">
+
+<nav class="series-nav">
+    <a href="tutorial.html">Part 1: Introduction</a>
+    <a href="tutorial-architecture.html" class="active">Part 2: Building It</a>
+    <a href="tutorial-deep-dive.html">Part 3: TTL, Replication & Future</a>
+</nav>
+
+<div class="toc">
+    <h3>Table of Contents</h3>
+    <ol>
+        <li><a href="#problem">Extending the working set</a></li>
+        <li><a href="#project-layout">Project layout</a></li>
+        <li><a href="#non-blocking">Non-blocking constraint</a></li>
+        <li><a href="#coalescing">Write coalescing</a></li>
+        <li><a href="#size-routing">Size-based routing</a></li>
+        <li><a href="#dynamo-sink">DynamoDB sink</a></li>
+        <li><a href="#s3-express-sink">S3 Express sink</a></li>
+        <li><a href="#background-loop">Background loop</a></li>
+        <li><a href="#read-through">Read-through</a></li>
+        <li><a href="#tradeoffs">Tradeoffs</a></li>
+        <li><a href="#running">Building and running</a></li>
+    </ol>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="problem">Extending Valkey's Working Set</h2>
+
+<p>Valkey is fast because everything lives in memory. But memory is finite and expensive. When your working set grows beyond what a single instance can hold, you have a few options: shard across multiple instances, evict cold keys, or extend Valkey with a durable backing store that transparently handles overflow. valkey-sink takes the third approach.</p>
+
+<p>The idea: every write to Valkey is asynchronously persisted to an external store. On a cache miss, <span class="inline-code">SINK.GET</span> transparently reads from the backend and repopulates the cache. From the application's perspective, Valkey's effective working set becomes the union of in-memory data and whatever is in the backing store, without changing a single line of application code beyond swapping GET for SINK.GET.</p>
+
+<p>For backends, valkey-sink currently has two sinks: <strong>DynamoDB</strong> for smaller values (below a configurable threshold, default 4KB) and <strong>S3 Express One Zone</strong> for larger values. DynamoDB gives single-digit millisecond latency with per-WCU pricing that favors small items; S3 Express gives single-digit millisecond latency at any object size with flat per-request pricing. A <span class="inline-code">SinkRouter</span> partitions writes by value size and dispatches to the right backend. The <span class="inline-code">Sink</span> trait (<span class="inline-code">write_batch</span> + <span class="inline-code">lookup</span>) is pluggable. Adding a new backend means implementing two methods.</p>
+
+<h3>Requirements</h3>
+
+<ol>
+    <li><strong>Transparent write-behind.</strong> Every SET is asynchronously persisted. No application code changes on the write path. Hot keys updated many times per second should be coalesced: only the final value in a debounce window gets flushed.</li>
+    <li><strong>Size-based routing.</strong> Small values go to DynamoDB, large values go to S3 Express. The threshold is configurable. Both sinks flush concurrently within a batch.</li>
+    <li><strong>Read-through on cache miss.</strong> <span class="inline-code">SINK.GET</span> checks the backend when Valkey returns nil, repopulates the cache, and returns the value, all invisible to the caller.</li>
+    <li><strong>TTL fidelity.</strong> Keys with an expiry in Valkey keep that expiry through the backend and back. Expired data is never served.</li>
+    <li><strong>Replica awareness.</strong> Write-behind runs on primaries only. Replicas still do read-through but don't duplicate writes.</li>
+    <li><strong>Zero impact on Valkey's main thread.</strong> Valkey is single-threaded. A 5ms network call in a keyspace handler stalls every client, and a cache miss can't <span class="inline-code">.await</span> anything. The module must not add measurable latency to SET or GET; all network I/O happens on background threads, and read-through uses BlockClient to suspend the caller while the event loop continues. (<a href="#non-blocking">non-blocking details</a>, <a href="#read-through">read-through details</a>)</li>
+</ol>
+
+<!-- ===================================================================== -->
+<h2 id="project-layout">Project Layout</h2>
+
+<pre><code>crates/
+  common/src/     <span class="comment">Shared library (valkey-common)</span>
+    lib.rs        <span class="comment">Re-exports aws, metrics, retry modules</span>
+    aws.rs        <span class="comment">SigV4 signing, credential loading, URL parsing</span>
+    retry.rs      <span class="comment">Exponential backoff + circuit breaker</span>
+    metrics.rs    <span class="comment">Latency tracker, counter helpers</span>
+  sink/src/       <span class="comment">Write-behind module (valkey-sink)</span>
+    lib.rs        <span class="comment">Module entry point, init/deinit, event handler</span>
+    config.rs     <span class="comment">Configuration parsing from module arguments</span>
+    channel.rs    <span class="comment">Message types for main thread to background</span>
+    coalesce.rs   <span class="comment">Write coalescing with debounce window</span>
+    background.rs <span class="comment">Tokio runtime, flush loop, retry orchestration</span>
+    metrics.rs    <span class="comment">Sink-specific counters, SINK.INFO output</span>
+    readthrough.rs <span class="comment">SINK.GET command with BlockClient</span>
+    sink/
+      mod.rs      <span class="comment">Sink trait, size-based router</span>
+      s3.rs       <span class="comment">S3 Express One Zone (CreateSession + SigV4)</span>
+      dynamo.rs   <span class="comment">DynamoDB via raw HTTP + SigV4</span></code></pre>
+
+<p>14 source files. No build scripts, no code generation, no macros beyond what <span class="inline-code">valkey-module</span> provides. The <span class="inline-code">Cargo.toml</span> has 13 direct dependencies, dominated by <span class="inline-code">tokio</span>, <span class="inline-code">reqwest</span>, and <span class="inline-code">valkey-module</span>.</p>
+
+<span class="file-ref">Cargo.toml</span>
+<pre><code>[<span class="keyword">dependencies</span>]
+<span class="type">valkey-module</span> = <span class="string">"0.1"</span>
+<span class="type">tokio</span> = { version = <span class="string">"1"</span>, features = [<span class="string">"rt-multi-thread"</span>, <span class="string">"time"</span>, <span class="string">"sync"</span>, <span class="string">"macros"</span>] }
+<span class="type">crossbeam-channel</span> = <span class="string">"0.5"</span>
+<span class="type">async-trait</span> = <span class="string">"0.1"</span>
+<span class="type">rand</span> = <span class="string">"0.8"</span>
+<span class="type">hex</span> = <span class="string">"0.4"</span>
+<span class="type">base64</span> = <span class="string">"0.22"</span>
+<span class="type">futures</span> = <span class="string">"0.3"</span>
+<span class="type">reqwest</span> = { version = <span class="string">"0.12"</span>, default-features = <span class="keyword">false</span>, features = [<span class="string">"rustls-tls"</span>, <span class="string">"json"</span>] }
+<span class="type">sha2</span> = <span class="string">"0.10"</span>
+<span class="type">serde</span> = { version = <span class="string">"1"</span>, features = [<span class="string">"derive"</span>] }
+<span class="type">serde_json</span> = <span class="string">"1"</span>
+<span class="type">linkme</span> = <span class="string">"0.3"</span>
+<span class="type">quick-xml</span> = <span class="string">"0.37"</span></code></pre>
+
+<p>The crate type is <span class="inline-code">cdylib</span>. Valkey loads it as a shared library at runtime. SigV4 signing is delegated to the <span class="inline-code">aws-sigv4</span> crate (in valkey-common, much smaller than the full AWS SDK), and DynamoDB binary encoding uses the <span class="inline-code">base64</span> crate. S3 Express CreateSession XML responses are parsed with <span class="inline-code">quick-xml</span>.</p>
+
+<!-- ===================================================================== -->
+<h2 id="non-blocking">The Non-Blocking Constraint</h2>
+
+<p>This is the fundamental constraint that shapes everything else. Valkey is single-threaded: every microsecond spent in a keyspace event handler is a microsecond where no other client can be served. Our module needs to intercept every SET, capture the key and value, and hand it off for persistence, all without adding measurable latency to the SET itself. The solution is a producer-consumer pattern with a bounded crossbeam channel:</p>
+
+<div class="architecture-diagram">
+<pre>Main thread (single-threaded)       Background (multi-threaded tokio)
++----------------------------+      +------------------------------+
+| SET key value              |      |                              |
+|   |                        |      |  crossbeam::Receiver         |
+|   v                        |      |    |                         |
+| keyspace_event_handler()   |      |    v                         |
+|   |                        |      |  CoalesceMap.upsert(k, v)    |
+|   v                        |      |    |                         |
+| channel.try_send(msg)  ----+----->|  timer.tick()                |
+|   |                        |      |    |                         |
+|   v                        |      |    v                         |
+| returns immediately        |      |  drain_ready() -> flush()    |
++----------------------------+      +------------------------------+</pre>
+</div>
+
+<p>The channel implementation details (why crossbeam over tokio channels, why <span class="inline-code">try_send</span> over <span class="inline-code">send</span>, the full keyspace event handler, and the message types) are in <span class="inline-code">channel.rs</span> and <span class="inline-code">lib.rs</span>. See <a href="READING-ORDER.md">READING-ORDER.md</a> for a guided path through every source file.</p>
+
+<!-- ===================================================================== -->
+<h2 id="coalescing">Write Coalescing</h2>
+
+<p>Without coalescing, a hot key updated 100 times per second would produce 100 S3 PutObject calls per second. That's expensive, slow, and pointless. Only the final value matters. The coalesce map solves this with a debounce window: updates within the window overwrite each other, and only the last value is flushed to the backend. It's a <span class="inline-code">HashMap&lt;Vec&lt;u8&gt;, PendingWrite&gt;</span> where each entry holds the latest value and a <span class="inline-code">first_seen</span> timestamp.</p>
+
+<span class="file-ref">crates/sink/src/coalesce.rs:19-26</span>
+<pre><code><span class="keyword">pub struct</span> <span class="type">PendingWrite</span> {
+    <span class="keyword">pub</span> value: <span class="type">Vec</span>&lt;<span class="keyword">u8</span>&gt;,
+    <span class="comment">/// Absolute expiry time as Unix epoch seconds. None means no expiry.</span>
+    <span class="keyword">pub</span> expires_at: <span class="type">Option</span>&lt;<span class="keyword">u64</span>&gt;,
+    <span class="comment">/// When this key first entered the map. Preserved across upserts so the</span>
+    <span class="comment">/// debounce deadline is anchored to the first write, not the last.</span>
+    <span class="keyword">pub</span> first_seen: <span class="type">Instant</span>,
+}</code></pre>
+
+<h3>How it works</h3>
+
+<div class="architecture-diagram">
+<pre>Time 0ms:    SET counter 1   ->  upsert("counter", "1", ttl=None, first_seen=0)
+Time 10ms:   SET counter 2   ->  upsert("counter", "2", ttl=None, first_seen=0)   value overwritten
+Time 100ms:  SET counter 3   ->  upsert("counter", "3", ttl=None, first_seen=0)   first_seen preserved
+...
+Time 1000ms: timer tick       ->  drain_ready() finds "counter"
+                              ->  flush("counter", "3") to backend       1 write, not 100</pre>
+</div>
+
+<span class="file-ref">crates/sink/src/coalesce.rs:49-61</span>
+<pre><code><span class="keyword">pub fn</span> <span class="function">upsert</span>(&<span class="keyword">mut self</span>, key: <span class="type">Vec</span>&lt;<span class="keyword">u8</span>&gt;, value: <span class="type">Vec</span>&lt;<span class="keyword">u8</span>&gt;, expires_at: <span class="type">Option</span>&lt;<span class="keyword">u64</span>&gt;) {
+    <span class="keyword">self</span>.pending
+        .entry(key)
+        .and_modify(|pw| {
+            pw.value = value.clone();
+            pw.expires_at = expires_at;
+        })
+        .or_insert(<span class="type">PendingWrite</span> {
+            value,
+            expires_at,
+            first_seen: <span class="type">Instant</span>::now(),
+        });
+}</code></pre>
+
+<p>The <span class="inline-code">and_modify</span> closure updates the value and TTL. <span class="inline-code">first_seen</span> is untouched on update so the debounce window stays anchored. On insert (<span class="inline-code">or_insert</span>), it records the current time.</p>
+
+<h3>Draining ready entries</h3>
+
+<span class="file-ref">crates/sink/src/coalesce.rs:65-82</span>
+<pre><code><span class="keyword">pub fn</span> <span class="function">drain_ready</span>(&<span class="keyword">mut self</span>) -> <span class="type">Vec</span>&lt;(<span class="type">Vec</span>&lt;<span class="keyword">u8</span>&gt;, <span class="type">Vec</span>&lt;<span class="keyword">u8</span>&gt;, <span class="type">Option</span>&lt;<span class="keyword">u64</span>&gt;)&gt; {
+    <span class="keyword">let</span> now = <span class="type">Instant</span>::now();
+    <span class="keyword">let</span> window = <span class="keyword">self</span>.debounce_window;
+
+    <span class="keyword">let mut</span> ready = <span class="type">Vec</span>::new();
+    <span class="keyword">self</span>.pending.retain(|k, pw| {
+        <span class="keyword">if</span> now.duration_since(pw.first_seen) >= window {
+            <span class="keyword">let</span> value = std::mem::take(&<span class="keyword">mut</span> pw.value);
+            ready.push((k.clone(), value, pw.expires_at));
+            <span class="keyword">false</span>  <span class="comment">// remove from map</span>
+        } <span class="keyword">else</span> {
+            <span class="keyword">true</span>   <span class="comment">// keep in map</span>
+        }
+    });
+    ready
+}</code></pre>
+
+<p>Uses <span class="inline-code">retain</span> to avoid cloning keys: ready entries are extracted in-place. The value is moved out via <span class="inline-code">std::mem::take</span> (swaps with an empty Vec) to avoid a clone.</p>
+
+<h3>Re-enqueue on failure</h3>
+
+<p>If a flush fails, entries are put back into the map. But only if a newer write has not already arrived for the same key:</p>
+
+<span class="file-ref">crates/sink/src/coalesce.rs:97-105</span>
+<pre><code><span class="keyword">pub fn</span> <span class="function">re_enqueue</span>(&<span class="keyword">mut self</span>, entries: <span class="type">Vec</span>&lt;(<span class="type">Vec</span>&lt;<span class="keyword">u8</span>&gt;, <span class="type">Vec</span>&lt;<span class="keyword">u8</span>&gt;, <span class="type">Option</span>&lt;<span class="keyword">u64</span>&gt;)&gt;) {
+    <span class="keyword">for</span> (key, value, expires_at) <span class="keyword">in</span> entries {
+        <span class="keyword">self</span>.pending.entry(key).or_insert(<span class="type">PendingWrite</span> {
+            value,
+            expires_at,
+            first_seen: <span class="type">Instant</span>::now(),
+        });
+    }
+}</code></pre>
+
+<p><span class="inline-code">or_insert</span> rather than <span class="inline-code">insert</span>. If the key is already in the map (a new write arrived during the failed flush), the newer value takes priority.</p>
+
+<!-- ===================================================================== -->
+<h2 id="size-routing">Size-Based Routing</h2>
+
+<p>DynamoDB has a 400KB item size limit and charges per write capacity unit (1KB per WCU). S3 has no practical size limit and charges per request regardless of size. So a 1KB value is cheaper in DynamoDB, and a 1MB value is far cheaper in S3. The <span class="inline-code">SinkRouter</span> uses a configurable size threshold (default 4KB) to route each value to the right backend. The router doesn't care what the backends are. It just partitions and dispatches:</p>
+
+<span class="file-ref">crates/sink/src/sink/mod.rs:83-107</span>
+<pre><code><span class="keyword">pub fn</span> <span class="function">partition_entries</span>&lt;<span class="lifetime">'a</span>&gt;(
+    &<span class="keyword">self</span>,
+    entries: &<span class="lifetime">'a</span> [<span class="type">SinkEntry</span>],
+) -> (<span class="type">Vec</span>&lt;&<span class="lifetime">'a</span> <span class="type">SinkEntry</span>&gt;, <span class="type">Vec</span>&lt;&<span class="lifetime">'a</span> <span class="type">SinkEntry</span>&gt;) {
+    <span class="keyword">let mut</span> dynamo_entries = <span class="type">Vec</span>::new();
+    <span class="keyword">let mut</span> s3_entries = <span class="type">Vec</span>::new();
+
+    <span class="keyword">for</span> entry <span class="keyword">in</span> entries {
+        <span class="keyword">match</span> (&<span class="keyword">self</span>.dynamo, &<span class="keyword">self</span>.s3) {
+            (<span class="type">Some</span>(_), <span class="type">Some</span>(_)) => {
+                <span class="keyword">if</span> entry.value.len() <= <span class="keyword">self</span>.size_threshold() {
+                    dynamo_entries.push(entry);
+                } <span class="keyword">else</span> {
+                    s3_entries.push(entry);
+                }
+            }
+            (<span class="type">Some</span>(_), <span class="type">None</span>) => dynamo_entries.push(entry),
+            (<span class="type">None</span>, <span class="type">Some</span>(_)) => s3_entries.push(entry),
+            (<span class="type">None</span>, <span class="type">None</span>) => {}
+        }
+    }
+
+    (dynamo_entries, s3_entries)
+}</code></pre>
+
+<p>The default threshold is 4KB, a reasonable split point where DynamoDB's per-WCU pricing is still competitive and S3 Express's per-request pricing starts to win. Both limits are configurable.</p>
+
+<p>DynamoDB and S3 flushes within a single batch run <strong>concurrently</strong> via <span class="inline-code">tokio::join!</span>, so flush latency is <span class="inline-code">max(dynamo, s3)</span> rather than <span class="inline-code">dynamo + s3</span>.</p>
+
+<!-- ===================================================================== -->
+<h2 id="dynamo-sink">DynamoDB Sink</h2>
+
+<p>DynamoDB is ideal for small, high-frequency key-value writes: single-digit millisecond latency, automatic scaling, and native TTL support. Like S3, we bypass the SDK and make direct HTTP POST requests to the DynamoDB JSON API, signed with SigV4. The table schema is deliberately minimal:</p>
+
+<table>
+    <thead>
+        <tr><th>Attribute</th><th>Type</th><th>Description</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><span class="inline-code">pk</span></td><td>B (Binary)</td><td>Valkey key bytes, base64-encoded</td></tr>
+        <tr><td><span class="inline-code">val</span></td><td>B (Binary)</td><td>Valkey value bytes, base64-encoded</td></tr>
+        <tr><td><span class="inline-code">ts</span></td><td>N (Number)</td><td>Unix timestamp of the write</td></tr>
+        <tr><td><span class="inline-code">ttl</span></td><td>N (Number)</td><td>Absolute expiry (epoch seconds). Omitted when no expiry. Can be configured as a DynamoDB TTL attribute for automatic cleanup.</td></tr>
+    </tbody>
+</table>
+
+<p>DynamoDB's BatchWriteItem is limited to 25 items per request. The sink chunks entries into batches of 25 and executes them <strong>concurrently</strong> via <span class="inline-code">futures::stream::buffer_unordered</span> (default concurrency: 32). Each chunk handles <span class="inline-code">UnprocessedItems</span> internally with up to 5 inner retries and exponential backoff.</p>
+
+<span class="file-ref">crates/sink/src/sink/dynamo.rs:152-244</span>
+<pre><code><span class="keyword">pub async fn</span> <span class="function">write_batch_refs</span>(&<span class="keyword">self</span>, entries: &[&<span class="type">SinkEntry</span>]) -> <span class="type">Result</span>&lt;(), <span class="type">SinkError</span>&gt; {
+    <span class="keyword">let</span> futs: <span class="type">Vec</span>&lt;_&gt; = entries.chunks(BATCH_WRITE_MAX)   <span class="comment">// BATCH_WRITE_MAX = 25</span>
+        .map(|chunk| {
+            <span class="keyword">let</span> requests: <span class="type">Vec</span>&lt;<span class="type">Value</span>&gt; = chunk.iter()
+                .map(|entry| {
+                    <span class="keyword">let mut</span> item = serde_json::<span class="type">Map</span>::new();
+                    item.insert(<span class="string">"pk"</span>,  <span class="macro">json!</span>({ <span class="string">"B"</span>: b64(&entry.key) }));
+                    item.insert(<span class="string">"val"</span>, <span class="macro">json!</span>({ <span class="string">"B"</span>: b64(&entry.value) }));
+                    item.insert(<span class="string">"ts"</span>,  <span class="macro">json!</span>({ <span class="string">"N"</span>: ts.to_string() }));
+                    <span class="keyword">if let</span> <span class="type">Some</span>(exp) = entry.expires_at {
+                        item.insert(<span class="string">"ttl"</span>, <span class="macro">json!</span>({ <span class="string">"N"</span>: exp.to_string() }));
+                    }
+                    <span class="macro">json!</span>({ <span class="string">"PutRequest"</span>: { <span class="string">"Item"</span>: item } })
+                })
+                .collect();
+
+            <span class="keyword">async move</span> {
+                <span class="keyword">self</span>.call_dynamo(<span class="string">"DynamoDB_20120810.BatchWriteItem"</span>, &body).<span class="keyword">await</span>
+            }
+        })
+        .collect();
+
+    <span class="keyword">let</span> results: <span class="type">Vec</span>&lt;_&gt; = stream::iter(futs)
+        .buffer_unordered(<span class="keyword">self</span>.write_concurrency)
+        .collect().<span class="keyword">await</span>;
+    <span class="comment">// ...</span>
+}</code></pre>
+
+<p>Both keys and values are base64-encoded into DynamoDB Binary attributes. Throttle responses (HTTP 400 with <span class="inline-code">ProvisionedThroughputExceededException</span> or <span class="inline-code">ThrottlingException</span>) are classified as retriable errors so the outer retry policy kicks in.</p>
+
+<!-- ===================================================================== -->
+<h2 id="s3-express-sink">S3 Express Sink</h2>
+
+<p>S3 Express One Zone provides single-digit millisecond latency for any object size, making it the natural choice for values above the DynamoDB threshold. Each value is stored as a separate S3 object via PutObject, with the Valkey key encoded into the object key path.</p>
+
+<h3>Session authentication</h3>
+
+<p>S3 Express directory buckets use a two-step auth flow that differs from regular S3. First, a <span class="inline-code">CreateSession</span> call (signed with standard IAM credentials via SigV4) returns temporary session credentials with a 5-minute TTL. Then, <span class="inline-code">PutObject</span> and <span class="inline-code">GetObject</span> requests are signed with those session credentials using the <span class="inline-code">x-amz-s3session-token</span> header (not the standard <span class="inline-code">x-amz-security-token</span>) and the <span class="inline-code">s3express</span> service scope.</p>
+
+<p>Session credentials are cached behind a <span class="inline-code">tokio::sync::RwLock</span> with a double-check pattern: the fast path acquires a read lock and returns the cached session if still valid; on expiry, a <span class="inline-code">Mutex</span> serializes refresh attempts so that only one task calls <span class="inline-code">CreateSession</span> while the rest wait and reuse the fresh session. This prevents a thundering herd when many concurrent uploads all discover the session expired at the same time. A 30-second early-refresh buffer (<span class="inline-code">is_expired</span> checks <span class="inline-code">elapsed + 30s >= ttl</span>) avoids using a session that expires mid-request.</p>
+
+<h3>Concurrent uploads</h3>
+
+<p>S3 writes are parallelized using <span class="inline-code">futures::stream::buffer_unordered</span> with a configurable concurrency limit (default 16). Session credentials are fetched once before the batch starts, so all uploads in a batch share the same session:</p>
+
+<span class="file-ref">crates/sink/src/sink/s3.rs:367-392</span>
+<pre><code><span class="keyword">pub async fn</span> <span class="function">write_batch_refs</span>(&<span class="keyword">self</span>, entries: &[&<span class="type">SinkEntry</span>]) -> <span class="type">Result</span>&lt;(), <span class="type">SinkError</span>&gt; {
+    <span class="keyword">self</span>.get_session_creds().<span class="keyword">await</span>?;
+
+    <span class="keyword">let</span> futs: <span class="type">Vec</span>&lt;_&gt; = entries.iter()
+        .map(|entry| {
+            <span class="keyword">let</span> obj_key = <span class="keyword">self</span>.object_key(&entry.key);
+            <span class="keyword">async move</span> { <span class="keyword">self</span>.put_object(&obj_key, body, expires_at).<span class="keyword">await</span> }
+        })
+        .collect();
+
+    <span class="keyword">let</span> results: <span class="type">Vec</span>&lt;_&gt; = stream::iter(futs)
+        .buffer_unordered(<span class="keyword">self</span>.write_concurrency)
+        .collect().<span class="keyword">await</span>;
+    <span class="comment">// ...</span>
+}</code></pre>
+
+<p>TTL is stored as an <span class="inline-code">x-amz-meta-expires-at</span> object metadata header at zero extra cost. On read-through, the sink checks this header and returns <span class="inline-code">None</span> for expired objects.</p>
+
+<!-- ===================================================================== -->
+<h2 id="background-loop">The Background Loop</h2>
+
+<p>The background runtime is a tokio multi-thread runtime with a configurable number of workers (default 4). Its main loop does three things on each tick: drain the channel, check for ready entries, flush them.</p>
+
+<span class="file-ref">crates/sink/src/background.rs:71-193</span>
+<pre><code><span class="keyword">async fn</span> <span class="function">run_loop</span>(
+    rx: <span class="type">Receiver</span>&lt;<span class="type">MainToBackground</span>&gt;,
+    router: <span class="type">SinkRouter</span>,
+    initial_debounce: <span class="type">Duration</span>,
+    max_entries: <span class="keyword">usize</span>,
+    retry_policy: <span class="type">RetryPolicy</span>,
+    circuit_breaker: <span class="type">CircuitBreaker</span>,
+) {
+    <span class="keyword">let mut</span> coalesce = <span class="type">CoalesceMap</span>::new(initial_debounce, max_entries);
+
+    <span class="comment">// Tick at half the debounce window.</span>
+    <span class="keyword">let</span> tick_interval = initial_debounce / <span class="number">2</span>;
+    <span class="keyword">let mut</span> timer = tokio::time::interval(
+        tick_interval.max(<span class="type">Duration</span>::from_millis(<span class="number">50</span>))
+    );
+
+    <span class="keyword">loop</span> {
+        <span class="comment">// 1. Drain all pending channel messages (non-blocking).</span>
+        <span class="keyword">let mut</span> shutdown_requested = <span class="keyword">false</span>;
+        <span class="keyword">loop</span> {
+            <span class="keyword">match</span> rx.try_recv() {
+                <span class="type">Ok</span>(<span class="type">MainToBackground</span>::KeyWritten { key, value, expires_at }) => {
+                    metrics::inc(&metrics::get().writes_coalesced);
+                    coalesce.upsert(key, value, expires_at);
+                }
+                <span class="comment">// ... ReadThrough, ConfigUpdate, Shutdown ...</span>
+                <span class="type">Err</span>(crossbeam_channel::<span class="type">TryRecvError</span>::Empty) => <span class="keyword">break</span>,
+                <span class="type">Err</span>(crossbeam_channel::<span class="type">TryRecvError</span>::Disconnected) => {
+                    shutdown_requested = <span class="keyword">true</span>;
+                    <span class="keyword">break</span>;
+                }
+            }
+        }
+
+        <span class="comment">// 2. Force-flush if over capacity.</span>
+        <span class="keyword">if</span> coalesce.is_over_capacity() {
+            <span class="keyword">let</span> all = coalesce.drain_all();
+            <span class="comment">// ... flush ...</span>
+        }
+
+        <span class="comment">// 3. Wait for timer tick, then drain ready entries.</span>
+        timer.tick().<span class="keyword">await</span>;
+
+        <span class="keyword">if</span> !circuit_breaker.is_open() {
+            <span class="keyword">let</span> ready = coalesce.drain_ready();
+            <span class="keyword">if</span> !ready.is_empty() {
+                <span class="comment">// ... flush with retry ...</span>
+            }
+        }
+    }
+}</code></pre>
+
+<h3>Timer tick frequency</h3>
+
+<p>The flush timer ticks at <span class="inline-code">debounce_window / 2</span>. With a 1s debounce, the timer fires every 500ms. This means entries are flushed within 1.0x to 1.5x the debounce window. We could tick faster for lower latency, but the overhead is not worth it for write-behind use cases.</p>
+
+<h3>Shutdown behavior</h3>
+
+<p>On shutdown, the loop drains all remaining entries regardless of the debounce window and flushes them. The <span class="inline-code">deinit</span> function in <span class="inline-code">lib.rs</span> sends a Shutdown message and then polls a completion flag for up to 5 seconds, returning as soon as the final flush finishes rather than sleeping unconditionally.</p>
+
+<!-- ===================================================================== -->
+<h2 id="read-through">Read-Through with BlockClient</h2>
+
+<p>Write-behind is only half the story. The other half is what happens on a cache miss. When a key has been evicted from memory but still exists in S3 or DynamoDB, we want <span class="inline-code">SINK.GET</span> to transparently fetch it, without the caller knowing or caring that the data came from a backend. But a backend lookup takes milliseconds, and we can't block the event loop waiting for it. Valkey's BlockClient API solves this: it lets a command handler say "I'm not done yet, I'll reply later" while the event loop continues serving other clients. Here's the flow:</p>
+
+<div class="architecture-diagram">
+<pre> 1. Client sends SINK.GET key
+ 2. Command handler calls native GET  ->  nil (cache miss)
+ 3. Handler calls ctx.block_client()  ->  client is suspended
+ 4. Handler sends ReadThrough message through channel
+ 5. Handler returns ValkeyValue::NoReply (event loop continues)
+
+ 6. Background runtime receives ReadThrough message
+ 7. Looks up key in DynamoDB, then S3 if not found
+ 8. Sends (value, expires_at) back via oneshot channel
+
+ 9.  Bridging thread receives result
+10.  Checks TTL: if expired, returns nil
+11.  Sets SKIP_ENQUEUE flag (prevents re-upload to backend)
+12.  Populates cache with SET + EX (future GETs are fast)
+13.  Replies to blocked client via ThreadSafeContext</pre>
+</div>
+
+<span class="file-ref">crates/sink/src/readthrough.rs:17-154</span>
+<pre><code><span class="keyword">pub fn</span> <span class="function">sink_get_command</span>(ctx: &<span class="type">Context</span>, args: <span class="type">Vec</span>&lt;<span class="type">ValkeyString</span>&gt;) -> <span class="type">ValkeyResult</span> {
+    <span class="comment">// Steps 1-4: GET, check cache, block client, send ReadThrough msg</span>
+    <span class="comment">// ...</span>
+
+    <span class="comment">// Step 5: Bridging thread -- converts async oneshot to sync reply.</span>
+    std::thread::spawn(<span class="keyword">move</span> || {
+        <span class="keyword">let</span> thread_ctx = <span class="type">ThreadSafeContext</span>::with_blocked_client(blocked_client);
+
+        <span class="keyword">match</span> rx.blocking_recv() {
+            <span class="type">Ok</span>(<span class="type">Some</span>((value, expires_at))) => {
+                metrics::inc(&metrics::get().read_through_hits);
+
+                <span class="comment">// Check if the data is already expired.</span>
+                <span class="keyword">let</span> now_secs = <span class="comment">/* SystemTime epoch seconds */</span>;
+                <span class="keyword">if let</span> <span class="type">Some</span>(exp) = expires_at {
+                    <span class="keyword">if</span> now_secs >= exp {
+                        thread_ctx.reply(<span class="type">Ok</span>(<span class="type">ValkeyValue</span>::Null));
+                        <span class="keyword">return</span>;
+                    }
+                }
+
+                <span class="comment">// Populate cache with binary-safe SET using &amp;[&amp;[u8]] args.</span>
+                <span class="comment">// Set SKIP_ENQUEUE so the keyspace handler doesn't re-upload.</span>
+                {
+                    <span class="keyword">let</span> guard = thread_ctx.lock();
+                    crate::SKIP_ENQUEUE.with(|f| f.set(<span class="keyword">true</span>));
+
+                    <span class="keyword">let</span> set_result = <span class="keyword">if let</span> <span class="type">Some</span>(exp) = expires_at {
+                        <span class="keyword">let</span> remaining = exp.saturating_sub(now_secs);
+                        <span class="keyword">if</span> remaining > <span class="number">0</span> {
+                            guard.call(<span class="string">"SET"</span>, &[key, value, <span class="string">b"EX"</span>, remaining_str])
+                        } <span class="keyword">else</span> {
+                            crate::SKIP_ENQUEUE.with(|f| f.set(<span class="keyword">false</span>));
+                            thread_ctx.reply(<span class="type">Ok</span>(<span class="type">ValkeyValue</span>::Null));
+                            <span class="keyword">return</span>;
+                        }
+                    } <span class="keyword">else</span> {
+                        guard.call(<span class="string">"SET"</span>, &[key, value])
+                    };
+
+                    <span class="keyword">if</span> set_result.is_err() {
+                        crate::SKIP_ENQUEUE.with(|f| f.set(<span class="keyword">false</span>));
+                    }
+                }
+
+                <span class="comment">// Reply with raw bytes (binary-safe).</span>
+                thread_ctx.reply(<span class="type">Ok</span>(<span class="type">ValkeyValue</span>::StringBuffer(value)));
+            }
+            <span class="type">Ok</span>(<span class="type">None</span>) | <span class="type">Err</span>(_) => {
+                metrics::inc(&metrics::get().read_through_misses);
+                thread_ctx.reply(<span class="type">Ok</span>(<span class="type">ValkeyValue</span>::Null));
+            }
+        }
+    });
+
+    <span class="type">Ok</span>(<span class="type">ValkeyValue</span>::NoReply)
+}</code></pre>
+
+<h3>Why a bridging thread?</h3>
+
+<p>The background runtime is async (tokio). The <span class="inline-code">ThreadSafeContext::reply()</span> API is synchronous. We cannot call <span class="inline-code">blocking_recv()</span> on a tokio task without risking deadlock (it would block a tokio worker). The bridging thread does zero I/O. It exists only to convert the async oneshot into a synchronous reply call. It lives for the duration of one lookup, typically 5-50ms.</p>
+
+<!-- ===================================================================== -->
+<h2 id="tradeoffs">Tradeoffs</h2>
+
+<p>Every design decision involves giving something up. Here's an honest accounting of what we traded away and why we think the tradeoffs are worth it.</p>
+
+<h3>Eventually consistent, not strongly consistent</h3>
+<p>SET + sink write is not atomic. There is a window (up to the debounce interval) where data exists only in Valkey's memory. A crash during this window loses the last debounce window of writes. We chose this deliberately: strong consistency would require synchronous writes on the main thread, which violates the non-blocking constraint. For a write-behind cache, eventual consistency is the right tradeoff.</p>
+
+<h3>DEL is not propagated</h3>
+<p>DEL commands are not currently captured. A deleted key remains in the backend until overwritten. This could be added by subscribing to the <span class="inline-code">del</span> event in the keyspace handler.</p>
+
+<h3>TTL and expiration</h3>
+<p>TTL is propagated to the backend when a key is SET with an expiry. However, keys that expire via Valkey's built-in eviction (the <span class="inline-code">@EXPIRED</span> event) are not handled. By the time the expiration event fires, the value is already gone from Valkey's memory and cannot be read. The backend retains the value until its own TTL-based cleanup runs (DynamoDB native TTL, or manual S3 lifecycle rules).</p>
+
+<h3>Replica cache populate</h3>
+<p>On replicas, <span class="inline-code">SINK.GET</span> reads from the backend but cannot populate the local cache (the SET fails with READONLY). Every <span class="inline-code">SINK.GET</span> on a replica hits the backend. This is intentional: replicas should not have independent caches that diverge from the primary.</p>
+
+<h3>Binary values in read-through</h3>
+<p>The read-through path uses <span class="inline-code">String::from_utf8_lossy</span> when calling SET to repopulate the cache. Non-UTF8 binary values will have invalid bytes replaced with the Unicode replacement character. For string values, this is correct. For raw binary, it is lossy.</p>
+
+
+<!-- ===================================================================== -->
+<h2 id="running">Building and Running</h2>
+
+<h3>Build</h3>
+
+<pre><code>cargo build --release
+<span class="comment"># Output: target/release/libvalkey_sink.so (Linux) or .dylib (macOS)</span></code></pre>
+
+<h3>Load into Valkey</h3>
+
+<pre><code><span class="comment"># S3 Express only</span>
+valkey-server --loadmodule ./target/release/libvalkey_sink.so \
+  mode s3 \
+  s3_bucket my-bucket--usw2-az3--x-s3 \
+  s3_region us-west-2
+
+<span class="comment"># DynamoDB only</span>
+valkey-server --loadmodule ./target/release/libvalkey_sink.so \
+  mode dynamo \
+  dynamo_table my-table
+
+<span class="comment"># Both (size-based routing)</span>
+valkey-server --loadmodule ./target/release/libvalkey_sink.so \
+  mode both \
+  s3_bucket my-bucket--usw2-az3--x-s3 \
+  dynamo_table my-table \
+  size_threshold <span class="number">4096</span> \
+  debounce_ms <span class="number">1000</span></code></pre>
+
+<h3>Configuration reference</h3>
+
+<table>
+    <thead>
+        <tr><th>Parameter</th><th>Default</th><th>Description</th></tr>
+    </thead>
+    <tbody>
+        <tr><td><span class="inline-code">mode</span></td><td><span class="inline-code">s3</span></td><td>s3, dynamo, or both</td></tr>
+        <tr><td><span class="inline-code">s3_bucket</span></td><td>(required)</td><td>S3 Express directory bucket name</td></tr>
+        <tr><td><span class="inline-code">s3_prefix</span></td><td><span class="inline-code">valkey-sink/</span></td><td>Object key prefix</td></tr>
+        <tr><td><span class="inline-code">s3_region</span></td><td>$AWS_REGION</td><td>AWS region for S3</td></tr>
+        <tr><td><span class="inline-code">s3_endpoint</span></td><td>(none)</td><td>Custom S3 endpoint (for LocalStack, MinIO)</td></tr>
+        <tr><td><span class="inline-code">dynamo_table</span></td><td>(required)</td><td>DynamoDB table name</td></tr>
+        <tr><td><span class="inline-code">dynamo_region</span></td><td>$AWS_REGION</td><td>AWS region for DynamoDB</td></tr>
+        <tr><td><span class="inline-code">size_threshold</span></td><td>4096</td><td>Routing threshold (bytes)</td></tr>
+        <tr><td><span class="inline-code">debounce_ms</span></td><td>1000</td><td>Coalesce window (ms)</td></tr>
+        <tr><td><span class="inline-code">background_threads</span></td><td>4</td><td>Tokio worker threads</td></tr>
+        <tr><td><span class="inline-code">channel_capacity</span></td><td>10000</td><td>Bounded channel size</td></tr>
+        <tr><td><span class="inline-code">s3_concurrency</span></td><td>16</td><td>Concurrent S3 PutObject requests per batch</td></tr>
+        <tr><td><span class="inline-code">dynamo_concurrency</span></td><td>32</td><td>Concurrent DynamoDB BatchWriteItem requests</td></tr>
+        <tr><td><span class="inline-code">max_retries</span></td><td>3</td><td>Retry attempts per flush</td></tr>
+        <tr><td><span class="inline-code">circuit_breaker_threshold</span></td><td>10</td><td>Failures before circuit opens</td></tr>
+        <tr><td><span class="inline-code">circuit_breaker_cooldown_ms</span></td><td>30000</td><td>Cooldown when open (ms)</td></tr>
+        <tr><td><span class="inline-code">coalesce_max_entries</span></td><td>1000000</td><td>Force-flush threshold</td></tr>
+        <tr><td><span class="inline-code">read_through</span></td><td>true</td><td>Enable SINK.GET read-through (true/false)</td></tr>
+    </tbody>
+</table>
+
+<h3>Running the tests</h3>
+
+<pre><code><span class="comment"># Unit tests (system allocator since ValkeyAlloc requires a running server)</span>
+cargo test --features enable-system-alloc</code></pre>
+
+<p>96 tests across 9 modules: aws (9), coalesce (20), config (13), dynamo (11), metrics (3 in sink + 12 in common), retry (13), s3 (8), and sink/mod (7).</p>
+
+<h3>AWS prerequisites</h3>
+
+<p>Environment variables:</p>
+<ul>
+    <li><span class="inline-code">AWS_ACCESS_KEY_ID</span></li>
+    <li><span class="inline-code">AWS_SECRET_ACCESS_KEY</span></li>
+    <li><span class="inline-code">AWS_SESSION_TOKEN</span> (optional, for temporary credentials)</li>
+    <li><span class="inline-code">AWS_REGION</span> (optional, defaults to us-east-1)</li>
+</ul>
+
+<p>DynamoDB table: single partition key named <span class="inline-code">pk</span> of type Binary (B), no sort key, PAY_PER_REQUEST billing. Optionally enable DynamoDB native TTL on the <span class="inline-code">ttl</span> attribute for automatic background cleanup of expired items.</p>
+
+<p>S3 Express: directory bucket in the target availability zone.</p>
+
+<!-- ===================================================================== -->
+<h2 id="reading-order">Reading Order</h2>
+
+<p>For a guided path through all 14 source files (entry point, write path, read path, cross-cutting concerns, and tooling), see <a href="READING-ORDER.md">READING-ORDER.md</a>. Following that order, you can understand the full system in about an hour.</p>
+
+<hr>
+
+<div class="bottom-nav">
+    <a href="tutorial.html">&larr; Part 1: Introduction</a>
+    <a href="tutorial-deep-dive.html">Part 3: TTL, Replication &amp; Future &rarr;</a>
+</div>
+
+</div>
+
+<div class="footer">
+    <p>Part 2 of 3 &middot; Built with <a href="https://github.com/valkey-io/valkeymodule-rs">valkeymodule-rs</a></p>
+</div>
+
+</body>
+</html>

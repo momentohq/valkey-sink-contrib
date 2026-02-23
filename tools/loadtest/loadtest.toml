@@ -1,0 +1,54 @@
+# valkey-sink load test configuration
+#
+# Usage:
+#   cargo run --release -- --config loadtest.toml
+#
+# CLI flags override any value set here.
+
+[valkey]
+url = "redis://127.0.0.1:6379"
+
+[module]
+# Path to the compiled module .so/.dylib. Required unless skip_load = true.
+path = "/path/to/libvalkey_sink.so"
+# Skip MODULE LOAD (module is already loaded).
+skip_load = false
+# Unload the module when done.
+unload = false
+
+# Module configuration — passed as key/value pairs to MODULE LOAD.
+# These map directly to valkey-sink's config.rs options.
+[module.config]
+mode = "both"                   # "s3", "dynamo", or "both"
+s3_bucket = "my-bucket--az1--x-s3"
+s3_prefix = "valkey-sink/"
+s3_region = "us-east-1"
+# s3_endpoint = "http://localhost:4566"  # for LocalStack / MinIO
+dynamo_table = "my-table"
+dynamo_region = "us-east-1"
+size_threshold = 65536          # bytes; values >= this route to S3
+debounce_ms = 1000              # coalesce window before flushing to sinks
+
+[bench]
+# Total number of keys to test.
+keys = 3000
+# Fraction of keys routed to S3 (large values).
+large_fraction = 0.2
+# Fraction of keys that get a TTL.
+ttl_fraction = 0.3
+# TTL in seconds for keys that have one.
+ttl_secs = 300
+# Seconds to wait for debounce flush before evicting.
+drain_secs = 3
+# Number of concurrent connections for the read-through phase.
+concurrency = 16
+
+[bench.small_key]
+# Value size range (bytes) for keys routed to DynamoDB.
+min = 64
+max = 4096
+
+[bench.large_key]
+# Value size range (bytes) for keys routed to S3.
+min = 65536
+max = 131072

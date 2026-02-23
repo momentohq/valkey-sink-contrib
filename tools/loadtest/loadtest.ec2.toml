@@ -1,0 +1,64 @@
+# valkey-sink load test — EC2 config (us-west-2)
+#
+# Usage:
+#   cargo run --release -- --config loadtest.ec2.toml --start-valkey
+#   cargo run --release -- --config loadtest.ec2.toml --skip-load
+#   cargo run --release -- --config loadtest.ec2.toml --emit-docker
+#
+# Override any value with CLI flags:
+#   cargo run --release -- --config loadtest.ec2.toml --skip-load --keys 5000 --concurrency 32
+
+[valkey]
+url = "redis://127.0.0.1:6379"
+
+# AWS credentials passed into the Docker container.
+# Priority: explicit creds here > imds_creds > nothing.
+# Leave access_key_id empty to skip explicit creds.
+[aws]
+access_key_id = ""
+secret_access_key = ""
+session_token = ""
+region = "us-west-2"
+# Fall back to EC2 instance metadata (IMDSv2) if explicit creds are empty.
+imds_creds = true
+
+[docker]
+image = "valkey/valkey:9"
+container_name = "valkey"
+network = "host"
+# Host path to the .so — mounted read-only into the container.
+host_module_path = "/home/ec2-user/valkey-sink/target/release/libvalkey_sink.so"
+# Where the .so appears inside the container.
+container_module_path = "/modules/libvalkey_sink.so"
+
+[module]
+# Container-side path (used by --loadmodule inside the container).
+path = "/modules/libvalkey_sink.so"
+skip_load = false
+unload = false
+
+[module.config]
+mode = "both"
+s3_bucket = "CHANGE-ME--usw2-az1--x-s3"
+s3_prefix = "valkey-sink/"
+s3_region = "us-west-2"
+dynamo_table = "CHANGE-ME"
+dynamo_region = "us-west-2"
+size_threshold = 65536
+debounce_ms = 1000
+
+[bench]
+keys = 3000
+large_fraction = 0.2
+ttl_fraction = 0.3
+ttl_secs = 300
+drain_secs = 3
+concurrency = 16
+
+[bench.small_key]
+min = 64
+max = 4096
+
+[bench.large_key]
+min = 65536
+max = 131072

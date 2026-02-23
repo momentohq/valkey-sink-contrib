@@ -1,0 +1,27 @@
+[package]
+name = "valkey-sink"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+valkey-common = { path = "../common" }
+valkey-module = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+crossbeam-channel = "0.5"
+async-trait = "0.1"
+rand = "0.8"
+hex = "0.4"
+base64 = "0.22"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+linkme = "0.3"
+quick-xml = "0.37"
+
+[features]
+# Use system allocator for unit tests (ValkeyAlloc requires a running server)
+enable-system-alloc = ["valkey-module/enable-system-alloc"]
