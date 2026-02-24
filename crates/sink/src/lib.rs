@@ -86,8 +86,34 @@ mod sink;
 use channel::MainToBackground;
 use config::{SinkConfig, SinkMode};
 use sink::dynamo::DynamoDbSink;
+use sink::postgres::PostgresSink;
 use sink::s3::S3ExpressSink;
-use sink::SinkRouter;
+use sink::{SinkId, SinkRouter};
+
+/// Resolve the effective (small, large) SinkId pair from config overrides + mode.
+fn effective_sink_ids(config: &SinkConfig) -> (SinkId, SinkId) {
+    let small = config.small_sink.as_deref()
+        .and_then(SinkId::from_str)
+        .unwrap_or(match config.mode {
+            SinkMode::S3Only => SinkId::S3,
+            SinkMode::DynamoOnly => SinkId::Dynamo,
+            SinkMode::PostgresOnly => SinkId::Postgres,
+            SinkMode::Both => SinkId::Dynamo,
+            SinkMode::S3Postgres => SinkId::Postgres,
+            SinkMode::DynamoPostgres => SinkId::Dynamo,
+        });
+    let large = config.large_sink.as_deref()
+        .and_then(SinkId::from_str)
+        .unwrap_or(match config.mode {
+            SinkMode::S3Only => SinkId::S3,
+            SinkMode::DynamoOnly => SinkId::Dynamo,
+            SinkMode::PostgresOnly => SinkId::Postgres,
+            SinkMode::Both => SinkId::S3,
+            SinkMode::S3Postgres => SinkId::S3,
+            SinkMode::DynamoPostgres => SinkId::Postgres,
+        });
+    (small, large)
+}
 
 /// Module initialization. Called once when Valkey loads the module.
 ///
@@ -108,11 +134,31 @@ fn init(ctx: &Context, args: &[ValkeyString]) -> Status {
 
     let rx = channel::init_channel(config.channel_capacity);
 
+    // AWS credentials are only required when S3 or DynamoDB sinks are actually
+    // used. Derive this from the *effective* routing (after applying overrides),
+    // not just the mode — so `mode=both small_sink=pg large_sink=pg` won't
+    // require AWS creds.
+    let (eff_small, eff_large) = effective_sink_ids(&config);
+    let needs_aws = matches!(eff_small, SinkId::S3 | SinkId::Dynamo)
+        || matches!(eff_large, SinkId::S3 | SinkId::Dynamo);
+
     let creds = match valkey_common::aws::Credentials::from_env() {
         Ok(c) => c,
         Err(e) => {
-            ctx.log_warning(&format!("valkey-sink: {}", e));
-            return Status::Err;
+            if needs_aws {
+                ctx.log_warning(&format!("valkey-sink: {}", e));
+                return Status::Err;
+            }
+            // Dummy credentials for PostgreSQL-only mode where AWS is not used.
+            ctx.log_notice(&format!(
+                "valkey-sink: AWS credentials not available ({}), ok for PostgreSQL-only mode",
+                e
+            ));
+            valkey_common::aws::Credentials {
+                access_key: String::new(),
+                secret_key: String::new(),
+                session_token: None,
+            }
         }
     };
 
@@ -265,11 +311,21 @@ fn keyspace_event_handler(ctx: &Context, _event_type: NotifyEvent, event: &str, 
 
 /// Construct the SinkRouter based on config.
 ///
-/// In "both" mode, both S3 and DynamoDB sinks are created and writes
-/// are routed by value size. In single-sink modes, only that sink is created.
+/// Creates only the sink backends required by the configured mode, then
+/// determines which sink handles small values and which handles large values.
 ///
-/// A single `Arc<RefreshableCredentials>` is shared across all sinks so that
-/// credential refresh happens once and is visible to both backends.
+/// Modes:
+/// - `S3Only`        -> all values to S3
+/// - `DynamoOnly`    -> all values to DynamoDB
+/// - `PostgresOnly`  -> all values to PostgreSQL
+/// - `Both`          -> small to DynamoDB, large to S3 (backwards compatible)
+/// - `S3Postgres`    -> small to PostgreSQL, large to S3
+/// - `DynamoPostgres`-> small to DynamoDB, large to PostgreSQL
+///
+/// The `small_sink` / `large_sink` config overrides allow any combination.
+///
+/// A single `Arc<RefreshableCredentials>` is shared across all AWS sinks so
+/// that credential refresh happens once and is visible to both backends.
 fn build_router(
     config: &SinkConfig,
     creds: &valkey_common::aws::Credentials,
@@ -279,53 +335,90 @@ fn build_router(
         valkey_common::aws::RefreshableCredentials::new(creds.clone()),
     );
 
-    let s3 = match config.mode {
-        SinkMode::S3Only | SinkMode::Both => {
-            let bucket = config
-                .s3_bucket
-                .clone()
-                .expect("valkey-sink: s3_bucket is required for S3 mode");
-            let region = config
-                .s3_region
-                .clone()
-                .unwrap_or_else(|| std::env::var("AWS_REGION").unwrap_or("us-east-1".into()));
+    // Determine effective routing FIRST, then derive which backends to construct.
+    // This ensures overrides fully replace mode defaults — e.g. mode=both with
+    // small_sink=postgres large_sink=postgres won't require S3/DynamoDB backends.
+    let (small_sink_id, large_sink_id) = effective_sink_ids(config);
 
-            Some(S3ExpressSink::new(
-                http_client.clone(),
-                shared_creds.clone(),
-                bucket,
-                config.s3_prefix.clone(),
-                region,
-                config.s3_endpoint.clone(),
-                config.s3_write_concurrency,
-            ))
-        }
-        SinkMode::DynamoOnly => None,
+    // Only construct backends that are actually referenced by the effective routing.
+    let effective = [small_sink_id, large_sink_id];
+    let needs_s3 = effective.contains(&SinkId::S3);
+    let needs_dynamo = effective.contains(&SinkId::Dynamo);
+    let needs_postgres = effective.contains(&SinkId::Postgres);
+
+    // Build S3 sink if needed.
+    let s3 = if needs_s3 {
+        let bucket = config
+            .s3_bucket
+            .clone()
+            .expect("valkey-sink: s3_bucket is required when S3 is active");
+        let region = config
+            .s3_region
+            .clone()
+            .unwrap_or_else(|| std::env::var("AWS_REGION").unwrap_or("us-east-1".into()));
+
+        Some(S3ExpressSink::new(
+            http_client.clone(),
+            shared_creds.clone(),
+            bucket,
+            config.s3_prefix.clone(),
+            region,
+            config.s3_endpoint.clone(),
+            config.s3_write_concurrency,
+        ))
+    } else {
+        None
     };
 
-    let dynamo = match config.mode {
-        SinkMode::DynamoOnly | SinkMode::Both => {
-            let table = config
-                .dynamo_table
-                .clone()
-                .expect("valkey-sink: dynamo_table is required for DynamoDB mode");
-            let region = config
-                .dynamo_region
-                .clone()
-                .unwrap_or_else(|| std::env::var("AWS_REGION").unwrap_or("us-east-1".into()));
+    // Build DynamoDB sink if needed.
+    let dynamo = if needs_dynamo {
+        let table = config
+            .dynamo_table
+            .clone()
+            .expect("valkey-sink: dynamo_table is required when DynamoDB is active");
+        let region = config
+            .dynamo_region
+            .clone()
+            .unwrap_or_else(|| std::env::var("AWS_REGION").unwrap_or("us-east-1".into()));
 
-            Some(DynamoDbSink::new(
-                http_client.clone(),
-                shared_creds.clone(),
-                table,
-                region,
-                config.dynamo_write_concurrency,
-            ))
-        }
-        SinkMode::S3Only => None,
+        Some(DynamoDbSink::new(
+            http_client.clone(),
+            shared_creds.clone(),
+            table,
+            region,
+            config.dynamo_write_concurrency,
+        ))
+    } else {
+        None
     };
 
-    SinkRouter::new(s3, dynamo, config.size_threshold_bytes)
+    // Build PostgreSQL sink if needed.
+    let postgres = if needs_postgres {
+        let conn_str = config
+            .pg_connection_string
+            .clone()
+            .expect("valkey-sink: pg_connection_string is required when PostgreSQL is active");
+        let table = config
+            .pg_table
+            .clone()
+            .unwrap_or_else(|| "valkey_sink".to_string());
+
+        match PostgresSink::new(
+            conn_str,
+            table,
+            config.pg_write_concurrency,
+            config.pg_pool_size,
+        ) {
+            Ok(pg) => Some(pg),
+            Err(e) => {
+                panic!("valkey-sink: failed to create PostgreSQL sink: {}", e);
+            }
+        }
+    } else {
+        None
+    };
+
+    SinkRouter::new(s3, dynamo, postgres, small_sink_id, large_sink_id, config.size_threshold_bytes)
 }
 
 /// `SINK.INFO` command handler. Returns all module metrics as a bulk string

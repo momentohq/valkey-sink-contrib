@@ -252,5 +252,15 @@ fn apply_config_delta(
         ConfigDelta::ReadThroughEnabled(enabled) => {
             crate::READ_THROUGH_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
         }
+        ConfigDelta::SmallSink(ref name) => {
+            if let Some(id) = crate::sink::SinkId::from_str(name) {
+                router.set_small_sink(id);
+            }
+        }
+        ConfigDelta::LargeSink(ref name) => {
+            if let Some(id) = crate::sink::SinkId::from_str(name) {
+                router.set_large_sink(id);
+            }
+        }
     }
 }

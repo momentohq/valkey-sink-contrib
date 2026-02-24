@@ -35,6 +35,8 @@ pub enum ConfigDelta {
     DebounceMs(u64),
     SizeThreshold(usize),
     ReadThroughEnabled(bool),
+    SmallSink(String),
+    LargeSink(String),
 }
 
 /// Global sender handle, initialized once during module load.

@@ -1,15 +1,16 @@
 [package]
-name = "valkey-sink-loadtest"
+name = "valkey-sink-sanity-test"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "loadtest"
+name = "sanity-test"
 path = "src/main.rs"
 
 [dependencies]
 redis = { version = "0.27", features = ["tokio-comp"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-postgres = "0.7"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

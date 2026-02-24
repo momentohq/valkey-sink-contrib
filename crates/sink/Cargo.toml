@@ -21,6 +21,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 linkme = "0.3"
 quick-xml = "0.37"
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
 
 [features]
 # Use system allocator for unit tests (ValkeyAlloc requires a running server)

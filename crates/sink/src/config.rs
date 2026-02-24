@@ -13,8 +13,14 @@ pub enum SinkMode {
     S3Only,
     /// Only DynamoDB.
     DynamoOnly,
-    /// Both — routes by value size (small → DynamoDB, large → S3).
+    /// Only PostgreSQL.
+    PostgresOnly,
+    /// S3 + DynamoDB — routes by value size (small → DynamoDB, large → S3).
     Both,
+    /// S3 + PostgreSQL — routes by value size.
+    S3Postgres,
+    /// DynamoDB + PostgreSQL — routes by value size.
+    DynamoPostgres,
 }
 
 impl SinkMode {
@@ -22,9 +28,17 @@ impl SinkMode {
         match s.to_lowercase().as_str() {
             "s3" | "s3only" => Some(Self::S3Only),
             "dynamo" | "dynamoonly" => Some(Self::DynamoOnly),
+            "postgres" | "postgresonly" => Some(Self::PostgresOnly),
             "both" => Some(Self::Both),
+            "s3postgres" | "s3-postgres" => Some(Self::S3Postgres),
+            "dynamopostgres" | "dynamo-postgres" => Some(Self::DynamoPostgres),
             _ => None,
         }
+    }
+
+    /// Returns true if this mode uses two sinks with size-based routing.
+    pub fn is_dual(&self) -> bool {
+        matches!(self, Self::Both | Self::S3Postgres | Self::DynamoPostgres)
     }
 }
 
@@ -50,10 +64,26 @@ pub struct SinkConfig {
     /// AWS region for DynamoDB (falls back to AWS_REGION env var).
     pub dynamo_region: Option<String>,
 
+    // -- PostgreSQL settings --
+    /// PostgreSQL connection string (e.g. "postgres://user:pass@host:5432/db").
+    pub pg_connection_string: Option<String>,
+    /// PostgreSQL table name.
+    pub pg_table: Option<String>,
+    /// Connection pool size for PostgreSQL. Default: 8.
+    pub pg_pool_size: u32,
+    /// Max concurrent batch INSERT statements for PostgreSQL. Default: 8.
+    pub pg_write_concurrency: usize,
+
     // -- Routing --
-    /// Values larger than this (bytes) go to S3; smaller go to DynamoDB.
-    /// Only applies in "both" mode. Default: 64KB.
+    /// Values larger than this (bytes) go to the large sink; smaller go to the small sink.
+    /// Only applies in dual-sink modes. Default: 64KB.
     pub size_threshold_bytes: usize,
+    /// Which sink to use for values <= size_threshold. Auto-detected from mode if not set.
+    /// Valid values: "s3", "dynamo", "postgres".
+    pub small_sink: Option<String>,
+    /// Which sink to use for values > size_threshold. Auto-detected from mode if not set.
+    /// Valid values: "s3", "dynamo", "postgres".
+    pub large_sink: Option<String>,
 
     // -- Coalescing --
     /// How long to wait before flushing a key (milliseconds). Default: 1000.
@@ -98,7 +128,13 @@ impl Default for SinkConfig {
             s3_endpoint: None,
             dynamo_table: None,
             dynamo_region: None,
+            pg_connection_string: None,
+            pg_table: None,
+            pg_pool_size: 8,
+            pg_write_concurrency: 8,
             size_threshold_bytes: 65_536, // 64KB
+            small_sink: None,
+            large_sink: None,
             debounce_window_ms: 1000,
             background_threads: 4,
             channel_capacity: 10_000,
@@ -136,6 +172,22 @@ impl SinkConfig {
                 "s3_endpoint" | "s3-endpoint" => config.s3_endpoint = Some(val.clone()),
                 "dynamo_table" | "dynamo-table" => config.dynamo_table = Some(val.clone()),
                 "dynamo_region" | "dynamo-region" => config.dynamo_region = Some(val.clone()),
+                "pg_connection_string" | "pg-connection-string" => {
+                    config.pg_connection_string = Some(val.clone());
+                }
+                "pg_table" | "pg-table" => config.pg_table = Some(val.clone()),
+                "pg_pool_size" | "pg-pool-size" => {
+                    if let Ok(v) = val.parse() {
+                        config.pg_pool_size = v;
+                    }
+                }
+                "pg_concurrency" | "pg-concurrency" | "pg_write_concurrency" | "pg-write-concurrency" => {
+                    if let Ok(v) = val.parse() {
+                        config.pg_write_concurrency = v;
+                    }
+                }
+                "small_sink" | "small-sink" => config.small_sink = Some(val.clone()),
+                "large_sink" | "large-sink" => config.large_sink = Some(val.clone()),
                 "size_threshold" | "size-threshold" => {
                     if let Ok(v) = val.parse() {
                         config.size_threshold_bytes = v;
@@ -376,5 +428,115 @@ mod tests {
             .into_iter().map(String::from).collect();
         let config = SinkConfig::from_args(&args);
         assert_eq!(config.s3_prefix, "custom/prefix/");
+    }
+
+    #[test]
+    fn test_pg_config_defaults() {
+        let config = SinkConfig::default();
+        assert_eq!(config.pg_connection_string, None);
+        assert_eq!(config.pg_table, None);
+        assert_eq!(config.pg_pool_size, 8);
+        assert_eq!(config.small_sink, None);
+        assert_eq!(config.large_sink, None);
+    }
+
+    #[test]
+    fn test_pg_config_from_args() {
+        let args: Vec<String> = vec![
+            "mode", "postgres",
+            "pg_connection_string", "postgres://user:pass@localhost:5432/db",
+            "pg_table", "sink_data",
+            "pg_pool_size", "16",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let config = SinkConfig::from_args(&args);
+        assert_eq!(config.mode, SinkMode::PostgresOnly);
+        assert_eq!(
+            config.pg_connection_string,
+            Some("postgres://user:pass@localhost:5432/db".into())
+        );
+        assert_eq!(config.pg_table, Some("sink_data".into()));
+        assert_eq!(config.pg_pool_size, 16);
+    }
+
+    #[test]
+    fn test_pg_config_from_args_hyphen_form() {
+        let args: Vec<String> = vec![
+            "pg-connection-string", "postgres://host/db",
+            "pg-table", "my_table",
+            "pg-pool-size", "4",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let config = SinkConfig::from_args(&args);
+        assert_eq!(config.pg_connection_string, Some("postgres://host/db".into()));
+        assert_eq!(config.pg_table, Some("my_table".into()));
+        assert_eq!(config.pg_pool_size, 4);
+    }
+
+    #[test]
+    fn test_sink_routing_overrides() {
+        let args: Vec<String> = vec![
+            "mode", "both",
+            "small_sink", "postgres",
+            "large_sink", "s3",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let config = SinkConfig::from_args(&args);
+        assert_eq!(config.small_sink, Some("postgres".into()));
+        assert_eq!(config.large_sink, Some("s3".into()));
+    }
+
+    #[test]
+    fn test_sink_routing_overrides_hyphen_form() {
+        let args: Vec<String> = vec![
+            "small-sink", "dynamo",
+            "large-sink", "postgres",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let config = SinkConfig::from_args(&args);
+        assert_eq!(config.small_sink, Some("dynamo".into()));
+        assert_eq!(config.large_sink, Some("postgres".into()));
+    }
+
+    #[test]
+    fn test_pg_pool_size_invalid_stays_default() {
+        let args: Vec<String> = vec!["pg_pool_size", "not_a_number"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let config = SinkConfig::from_args(&args);
+        assert_eq!(config.pg_pool_size, 8); // stays at default
+    }
+
+    #[test]
+    fn test_postgres_mode_variants() {
+        assert_eq!(SinkMode::from_str("postgres"), Some(SinkMode::PostgresOnly));
+        assert_eq!(SinkMode::from_str("postgresonly"), Some(SinkMode::PostgresOnly));
+        assert_eq!(SinkMode::from_str("s3postgres"), Some(SinkMode::S3Postgres));
+        assert_eq!(SinkMode::from_str("s3-postgres"), Some(SinkMode::S3Postgres));
+        assert_eq!(SinkMode::from_str("dynamopostgres"), Some(SinkMode::DynamoPostgres));
+        assert_eq!(SinkMode::from_str("dynamo-postgres"), Some(SinkMode::DynamoPostgres));
+    }
+
+    #[test]
+    fn test_is_dual() {
+        assert!(!SinkMode::S3Only.is_dual());
+        assert!(!SinkMode::DynamoOnly.is_dual());
+        assert!(!SinkMode::PostgresOnly.is_dual());
+        assert!(SinkMode::Both.is_dual());
+        assert!(SinkMode::S3Postgres.is_dual());
+        assert!(SinkMode::DynamoPostgres.is_dual());
     }
 }

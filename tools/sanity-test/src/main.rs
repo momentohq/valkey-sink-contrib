@@ -1,4 +1,4 @@
-//! valkey-sink load tester
+//! valkey-sink sanity tester
 //!
 //! Connects to a running Valkey instance, loads the valkey-sink module,
 //! populates keys of various sizes (triggering write-behind to sinks),
@@ -8,9 +8,9 @@
 //! Configuration is read from a TOML file. CLI flags override TOML values.
 //!
 //! Usage:
-//!   cargo run --release -- --config loadtest.toml --start-valkey
-//!   cargo run --release -- --config loadtest.toml --skip-load
-//!   cargo run --release -- --config loadtest.toml --emit-docker
+//!   cargo run --release -- --config sanity-test.toml --start-valkey
+//!   cargo run --release -- --config sanity-test.toml --skip-load
+//!   cargo run --release -- --config sanity-test.toml --emit-docker
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -33,6 +33,7 @@ struct TomlConfig {
     docker: TomlDocker,
     module: TomlModule,
     bench: TomlBench,
+    postgres: TomlPostgres,
 }
 
 #[derive(Deserialize, Default)]
@@ -134,13 +135,24 @@ struct TomlKeyRange {
     max: usize,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TomlPostgres {
+    /// PostgreSQL connection string for verification queries
+    connection_string: String,
+    /// Table name (default: valkey_sink)
+    table: String,
+    /// Enable PG verification in the test
+    enabled: bool,
+}
+
 // ---------------------------------------------------------------------------
 // CLI args — override TOML values
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "valkey-sink-loadtest")]
-#[command(about = "End-to-end load tester and benchmark for valkey-sink")]
+#[command(name = "valkey-sink-sanity-test")]
+#[command(about = "End-to-end sanity tester and benchmark for valkey-sink")]
 struct Args {
     /// Path to the TOML config file
     #[arg(long, short)]
@@ -213,6 +225,10 @@ struct Args {
     /// Unload the module when done
     #[arg(long)]
     unload: bool,
+
+    /// Run sanity checks across multiple sink configurations
+    #[arg(long)]
+    multi_config: bool,
 
     /// Run sustained writes for N seconds (instead of burst populate+drain+read-through)
     #[arg(long)]
@@ -430,8 +446,10 @@ fn build_docker_cmd(toml: &TomlConfig) -> Vec<String> {
     // Image
     cmd.push(d.image.clone());
 
-    // Valkey server + --loadmodule with module args
+    // Valkey server + --enable-module-command local + --loadmodule with module args
     cmd.push("valkey-server".into());
+    cmd.push("--enable-module-command".into());
+    cmd.push("local".into());
     cmd.push("--loadmodule".into());
     cmd.push(module_path.into());
     for (k, v) in &toml.module.config {
@@ -570,9 +588,9 @@ fn start_valkey(toml: &TomlConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Image + valkey-server --loadmodule
+    // Image + valkey-server --enable-module-command local --loadmodule
     cmd.arg(&d.image);
-    cmd.args(["valkey-server", "--loadmodule", module_path]);
+    cmd.args(["valkey-server", "--enable-module-command", "local", "--loadmodule", module_path]);
     for (k, v) in &toml.module.config {
         cmd.arg(k);
         match v {
@@ -687,7 +705,7 @@ fn random_value(size: usize) -> Vec<u8> {
 }
 
 fn key_name(i: usize) -> String {
-    format!("loadtest:sink:{:06}", i)
+    format!("sanity:sink:{:06}", i)
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +743,7 @@ async fn run_sustained(
     let report_interval = Duration::from_secs(cfg.report_interval);
 
     println!("===============================================================================");
-    println!("  valkey-sink SUSTAINED LOAD TEST");
+    println!("  valkey-sink SUSTAINED SANITY TEST");
     println!("===============================================================================");
     println!("  target:       {}", cfg.url);
     println!("  duration:     {}s", cfg.sustained_secs);
@@ -758,6 +776,8 @@ async fn run_sustained(
     let s3_writes_before = parse_info_val(&info_before, "sink_s3_writes:");
     let dynamo_failures_before = parse_info_val(&info_before, "sink_dynamo_write_failures:");
     let s3_failures_before = parse_info_val(&info_before, "sink_s3_write_failures:");
+    let pg_writes_before = parse_info_val(&info_before, "sink_pg_writes:");
+    let pg_failures_before = parse_info_val(&info_before, "sink_pg_write_failures:");
 
     // Shared atomic counter for total writes issued
     let writes_issued = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -806,7 +826,7 @@ async fn run_sustained(
                 }
 
                 // Generate unique key using task_id + local_count
-                let key = format!("loadtest:sustained:{}:{:08}", task_id, local_count);
+                let key = format!("sanity:sustained:{}:{:08}", task_id, local_count);
                 let is_large = rng.gen::<f64>() < large_fraction;
                 let size = if is_large {
                     rng.gen_range(large_range.0..large_range.1)
@@ -846,11 +866,12 @@ async fn run_sustained(
     let mut last_report = Instant::now();
     let mut last_dynamo = dynamo_writes_before;
     let mut last_s3 = s3_writes_before;
+    let mut last_pg = pg_writes_before;
     let mut last_issued = 0u64;
 
-    println!("{:<8} {:>10} {:>10} {:>10} {:>12} {:>12} {:>12}",
-        "elapsed", "issued", "ddb_flush", "s3_flush", "ddb_tps", "s3_tps", "issue_tps");
-    println!("{}", "-".repeat(80));
+    println!("{:<8} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>12} {:>12}",
+        "elapsed", "issued", "ddb_flush", "s3_flush", "pg_flush", "ddb_tps", "s3_tps", "pg_tps", "issue_tps");
+    println!("{}", "-".repeat(104));
 
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -865,22 +886,26 @@ async fn run_sustained(
             let info: String = redis::cmd("SINK.INFO").query_async(conn).await?;
             let dynamo_now = parse_info_val(&info, "sink_dynamo_writes:");
             let s3_now = parse_info_val(&info, "sink_s3_writes:");
+            let pg_now = parse_info_val(&info, "sink_pg_writes:");
             let issued_now = writes_issued.load(std::sync::atomic::Ordering::Relaxed);
 
             let dt = last_report.elapsed().as_secs_f64();
             let ddb_tps = (dynamo_now - last_dynamo) as f64 / dt;
             let s3_tps = (s3_now - last_s3) as f64 / dt;
+            let pg_tps = (pg_now - last_pg) as f64 / dt;
             let issue_tps = (issued_now - last_issued) as f64 / dt;
 
-            println!("{:<8.0}s {:>10} {:>10} {:>10} {:>12.0} {:>12.0} {:>12.0}",
+            println!("{:<8.0}s {:>10} {:>10} {:>10} {:>10} {:>12.0} {:>12.0} {:>12.0} {:>12.0}",
                 elapsed.as_secs_f64(),
                 issued_now,
                 dynamo_now - dynamo_writes_before,
                 s3_now - s3_writes_before,
-                ddb_tps, s3_tps, issue_tps);
+                pg_now - pg_writes_before,
+                ddb_tps, s3_tps, pg_tps, issue_tps);
 
             last_dynamo = dynamo_now;
             last_s3 = s3_now;
+            last_pg = pg_now;
             last_issued = issued_now;
             last_report = Instant::now();
         }
@@ -904,12 +929,14 @@ async fn run_sustained(
     let s3_total = parse_info_val(&info, "sink_s3_writes:") - s3_writes_before;
     let dynamo_fail = parse_info_val(&info, "sink_dynamo_write_failures:") - dynamo_failures_before;
     let s3_fail = parse_info_val(&info, "sink_s3_write_failures:") - s3_failures_before;
+    let pg_total = parse_info_val(&info, "sink_pg_writes:") - pg_writes_before;
+    let pg_fail = parse_info_val(&info, "sink_pg_write_failures:") - pg_failures_before;
     let write_failures = parse_info_val(&info, "sink_write_failures:");
     let coalesce_size = parse_info_val(&info, "sink_coalesce_map_size:");
 
     println!();
     println!("===============================================================================");
-    println!("  SUSTAINED LOAD TEST RESULTS");
+    println!("  SUSTAINED SANITY TEST RESULTS");
     println!("===============================================================================");
     println!("  Duration:              {:.1}s", total_elapsed.as_secs_f64());
     println!("  Writes issued:         {}", total_issued);
@@ -923,23 +950,528 @@ async fn run_sustained(
     println!("  S3 Express failures:   {}", s3_fail);
     println!("  S3 Express avg TPS:    {:.0}", s3_total as f64 / cfg.sustained_secs as f64);
     println!();
+    println!("  PostgreSQL flushed:    {}", pg_total);
+    println!("  PostgreSQL failures:   {}", pg_fail);
+    println!("  PostgreSQL avg TPS:    {:.0}", pg_total as f64 / cfg.sustained_secs as f64);
+    println!();
     println!("  Flush failures:        {}", write_failures);
     println!("  Coalesce map pending:  {}", coalesce_size);
     println!();
     println!("  --- Write Latency ---");
     println!("  DynamoDB:  {}", parse_info_latency(&info, "sink_dynamo_write_latency:"));
     println!("  S3:        {}", parse_info_latency(&info, "sink_s3_write_latency:"));
+    println!("  PostgreSQL:{}", parse_info_latency(&info, "sink_pg_write_latency:"));
     println!("  Flush:     {}", parse_info_latency(&info, "sink_flush_latency:"));
     println!();
     println!("  --- Read Latency (from prior lookups) ---");
     println!("  DynamoDB:  {}", parse_info_latency(&info, "sink_dynamo_read_latency:"));
     println!("  S3:        {}", parse_info_latency(&info, "sink_s3_read_latency:"));
+    println!("  PostgreSQL:{}", parse_info_latency(&info, "sink_pg_read_latency:"));
     println!("  Combined:  {}", parse_info_latency(&info, "sink_read_through_latency:"));
     println!();
 
     // Full SINK.INFO
     println!("=== Final SINK.INFO ===");
     println!("{}", info);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Multi-config test mode
+// ---------------------------------------------------------------------------
+
+struct SinkTestConfig {
+    name: &'static str,
+    module_args: Vec<String>,
+    /// Whether this config needs AWS credentials
+    needs_aws: bool,
+    /// Whether this config uses PG (for verification)
+    uses_pg: bool,
+}
+
+/// Restart Valkey via Docker with new module args for multi-config testing.
+/// Stops the existing container, starts a new one with the given loadmodule args,
+/// and waits for Valkey to be ready.
+fn restart_valkey_with_config(
+    toml_cfg: &TomlConfig,
+    module_args: &[String],
+    aws_creds: &Option<AwsCreds>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let d = &toml_cfg.docker;
+    let module_path = toml_cfg
+        .module
+        .path
+        .as_deref()
+        .unwrap_or(&d.container_module_path);
+
+    // Remove existing container
+    let _ = Command::new("docker")
+        .args(["rm", "-f", &d.container_name])
+        .output();
+
+    // Build docker run command
+    let mut cmd = Command::new("docker");
+    cmd.args(["run", "-d", "--name", &d.container_name]);
+
+    if !d.network.is_empty() {
+        cmd.args(["--network", &d.network]);
+    }
+
+    if !d.host_module_path.is_empty() {
+        cmd.args([
+            "-v",
+            &format!("{}:{}:ro", d.host_module_path, d.container_module_path),
+        ]);
+    }
+
+    // AWS creds
+    if let Some(creds) = aws_creds {
+        cmd.args(["-e", &format!("AWS_ACCESS_KEY_ID={}", creds.access_key_id)]);
+        cmd.args(["-e", &format!("AWS_SECRET_ACCESS_KEY={}", creds.secret_access_key)]);
+        if !creds.session_token.is_empty() {
+            cmd.args(["-e", &format!("AWS_SESSION_TOKEN={}", creds.session_token)]);
+        }
+        if !creds.region.is_empty() {
+            cmd.args(["-e", &format!("AWS_REGION={}", creds.region)]);
+        }
+    }
+
+    cmd.arg(&d.image);
+    cmd.args(["valkey-server", "--enable-module-command", "local", "--loadmodule", module_path]);
+    for arg in module_args {
+        cmd.arg(arg);
+    }
+
+    let output = cmd.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("docker run failed: {}", stderr).into());
+    }
+
+    // Wait for Valkey to be ready
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(500));
+        let ping = Command::new("docker")
+            .args(["exec", &d.container_name, "valkey-cli", "PING"])
+            .output();
+        if let Ok(out) = ping {
+            let reply = String::from_utf8_lossy(&out.stdout);
+            if reply.trim() == "PONG" {
+                return Ok(());
+            }
+        }
+    }
+
+    Err("Valkey did not become ready within 15 seconds".into())
+}
+
+/// Run sanity checks across multiple sink configurations, restarting Valkey
+/// for each one.  Prints a summary table at the end.
+async fn run_multi_config(
+    base_cfg: &Config,
+    toml_cfg: &TomlConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // -----------------------------------------------------------------------
+    // Extract sink-related values from the TOML [module.config] and [postgres]
+    // -----------------------------------------------------------------------
+    let str_val = |key: &str| -> String {
+        toml_cfg
+            .module
+            .config
+            .get(key)
+            .and_then(|v| match v {
+                toml::Value::String(s) => Some(s.clone()),
+                toml::Value::Integer(n) => Some(n.to_string()),
+                other => Some(other.to_string()),
+            })
+            .unwrap_or_default()
+    };
+
+    let dynamo_table = str_val("dynamo_table");
+    let dynamo_region = str_val("dynamo_region");
+    let s3_bucket = str_val("s3_bucket");
+    let s3_prefix = str_val("s3_prefix");
+    let s3_region = str_val("s3_region");
+    let pg_conn = str_val("pg_connection_string");
+    let pg_table_mod = str_val("pg_table");
+    let pg_pool_size = {
+        let v = str_val("pg_pool_size");
+        if v.is_empty() { "4".to_string() } else { v }
+    };
+    let pg_write_concurrency = {
+        let v = str_val("pg_write_concurrency");
+        if v.is_empty() { "4".to_string() } else { v }
+    };
+
+    // Check if AWS credentials are available
+    let aws_creds = resolve_aws_creds(toml_cfg)?;
+    let has_aws = aws_creds.is_some();
+
+    // PG verification connection string from [postgres] section
+    let pg_verify_conn = &toml_cfg.postgres.connection_string;
+    let pg_verify_table = if toml_cfg.postgres.table.is_empty() {
+        "valkey_sink"
+    } else {
+        &toml_cfg.postgres.table
+    };
+
+    // -----------------------------------------------------------------------
+    // Define the 5 test configurations
+    // -----------------------------------------------------------------------
+    let configs = vec![
+        SinkTestConfig {
+            name: "dynamo-only",
+            module_args: vec![
+                "mode".into(), "dynamo".into(),
+                "dynamo_table".into(), dynamo_table.clone(),
+                "dynamo_region".into(), dynamo_region.clone(),
+                "debounce_ms".into(), "500".into(),
+                "size_threshold".into(), "65536".into(),
+            ],
+            needs_aws: true,
+            uses_pg: false,
+        },
+        SinkTestConfig {
+            name: "postgres-only",
+            module_args: vec![
+                "mode".into(), "postgres".into(),
+                "pg_connection_string".into(), pg_conn.clone(),
+                "pg_table".into(), pg_table_mod.clone(),
+                "pg_pool_size".into(), pg_pool_size.clone(),
+                "pg_write_concurrency".into(), pg_write_concurrency.clone(),
+                "debounce_ms".into(), "500".into(),
+                "size_threshold".into(), "65536".into(),
+            ],
+            needs_aws: false,
+            uses_pg: true,
+        },
+        SinkTestConfig {
+            name: "s3-only",
+            module_args: vec![
+                "mode".into(), "s3".into(),
+                "s3_bucket".into(), s3_bucket.clone(),
+                "s3_prefix".into(), s3_prefix.clone(),
+                "s3_region".into(), s3_region.clone(),
+                "debounce_ms".into(), "500".into(),
+                "size_threshold".into(), "65536".into(),
+            ],
+            needs_aws: true,
+            uses_pg: false,
+        },
+        SinkTestConfig {
+            name: "both (dynamo+s3)",
+            module_args: vec![
+                "mode".into(), "both".into(),
+                "dynamo_table".into(), dynamo_table.clone(),
+                "dynamo_region".into(), dynamo_region.clone(),
+                "s3_bucket".into(), s3_bucket.clone(),
+                "s3_prefix".into(), s3_prefix.clone(),
+                "s3_region".into(), s3_region.clone(),
+                "debounce_ms".into(), "500".into(),
+                "size_threshold".into(), "65536".into(),
+            ],
+            needs_aws: true,
+            uses_pg: false,
+        },
+        SinkTestConfig {
+            name: "s3-postgres",
+            module_args: vec![
+                "mode".into(), "s3-postgres".into(),
+                "s3_bucket".into(), s3_bucket.clone(),
+                "s3_prefix".into(), s3_prefix.clone(),
+                "s3_region".into(), s3_region.clone(),
+                "pg_connection_string".into(), pg_conn.clone(),
+                "pg_table".into(), pg_table_mod.clone(),
+                "pg_pool_size".into(), pg_pool_size.clone(),
+                "pg_write_concurrency".into(), pg_write_concurrency.clone(),
+                "debounce_ms".into(), "500".into(),
+                "size_threshold".into(), "65536".into(),
+            ],
+            needs_aws: true,
+            uses_pg: true,
+        },
+    ];
+
+    let module_path = base_cfg.module_path.as_deref().ok_or(
+        "--module-path (or [module] path in TOML) is required for --multi-config",
+    )?;
+    // module_path is only used for display here; the Docker container uses the
+    // container_module_path from [docker] config
+    let _ = module_path;
+
+    let small_keys = 20usize;
+    let large_keys = 5usize;
+    let total_keys = small_keys + large_keys;
+
+    // results: (name, passed, detail)
+    let mut results: Vec<(&str, bool, String)> = Vec::new();
+
+    println!("===============================================================================");
+    println!("  MULTI-CONFIG SANITY TEST");
+    println!("===============================================================================");
+    println!("  target:       {}", base_cfg.url);
+    println!("  docker image: {}", toml_cfg.docker.image);
+    println!("  keys/config:  {} ({} small + {} large)", total_keys, small_keys, large_keys);
+    println!("  configs:      {}", configs.len());
+    println!();
+
+    for test_cfg in &configs {
+        println!("=== Config: {} ===", test_cfg.name);
+
+        // Check AWS requirement
+        if test_cfg.needs_aws && !has_aws {
+            println!("  SKIP: AWS credentials not available");
+            results.push((test_cfg.name, false, "SKIPPED (no AWS creds)".into()));
+            println!();
+            continue;
+        }
+
+        // Check PG requirement
+        if test_cfg.uses_pg && pg_conn.is_empty() {
+            println!("  SKIP: pg_connection_string not configured in TOML");
+            results.push((test_cfg.name, false, "SKIPPED (no PG config)".into()));
+            println!();
+            continue;
+        }
+
+        // Step 1: Restart Valkey with this config's module args
+        println!("  [1] Restarting Valkey with args: {}", test_cfg.module_args.join(" "));
+        match restart_valkey_with_config(toml_cfg, &test_cfg.module_args, &aws_creds) {
+            Ok(()) => println!("      Valkey ready."),
+            Err(e) => {
+                let detail = format!("Docker restart failed: {}", e);
+                println!("      FAIL: {}", detail);
+                results.push((test_cfg.name, false, detail));
+                println!();
+                continue;
+            }
+        }
+
+        // Step 2: Connect to the fresh Valkey instance
+        let client = redis::Client::open(base_cfg.url.as_str())?;
+        let mut conn = client.get_multiplexed_async_connection().await?;
+
+        // Step 3: Verify SINK.INFO responds
+        println!("  [2] Verifying SINK.INFO...");
+        let info_result: Result<String, _> = redis::cmd("SINK.INFO")
+            .query_async(&mut conn)
+            .await;
+        if let Err(e) = &info_result {
+            let detail = format!("SINK.INFO failed: {}", e);
+            println!("      FAIL: {}", detail);
+            results.push((test_cfg.name, false, detail));
+            println!();
+            continue;
+        }
+
+        // Snapshot initial metrics (fresh container, should be 0)
+        let info_before = info_result.unwrap();
+        let flushed_before = parse_info_val(&info_before, "sink_writes_flushed:");
+        let failures_before = parse_info_val(&info_before, "sink_write_failures:");
+        let rt_hits_before = parse_info_val(&info_before, "sink_read_through_hits:");
+
+        // Step 4: Write 20 small keys + 5 large keys
+        let key_prefix = test_cfg.name;
+        println!("  [3] Writing {} keys ({} small + {} large)...", total_keys, small_keys, large_keys);
+        let mut rng = rand::thread_rng();
+        let mut all_keys: Vec<String> = Vec::with_capacity(total_keys);
+
+        for i in 0..small_keys {
+            let key = format!("sanity:multi:{}:{:04}", key_prefix, i);
+            let size = rng.gen_range(64..4096);
+            let value = random_value(size);
+            conn.set::<_, _, ()>(&key, value).await?;
+            all_keys.push(key);
+        }
+        for i in 0..large_keys {
+            let key = format!("sanity:multi:{}:{:04}", key_prefix, small_keys + i);
+            let size = rng.gen_range(65_536..131_072);
+            let value = random_value(size);
+            conn.set::<_, _, ()>(&key, value).await?;
+            all_keys.push(key);
+        }
+
+        // Step 5: Sleep for debounce flush
+        println!("  [4] Waiting 2s for debounce flush...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Step 6: Check SINK.INFO metrics
+        println!("  [5] Checking SINK.INFO metrics...");
+        let info: String = redis::cmd("SINK.INFO").query_async(&mut conn).await?;
+        let flushed_now = parse_info_val(&info, "sink_writes_flushed:");
+        let failures_now = parse_info_val(&info, "sink_write_failures:");
+        let writes_flushed = flushed_now - flushed_before;
+        let write_failures = failures_now - failures_before;
+
+        println!("      writes_flushed={} write_failures={}", writes_flushed, write_failures);
+
+        if write_failures > 0 {
+            let detail = format!(
+                "write_failures={} (flushed={})",
+                write_failures, writes_flushed,
+            );
+            println!("      FAIL: {}", detail);
+            results.push((test_cfg.name, false, detail));
+            println!();
+            continue;
+        }
+
+        if writes_flushed < total_keys as u64 {
+            // Give another 2s for stragglers
+            println!("      Only {} flushed so far, waiting 2 more seconds...", writes_flushed);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let info2: String = redis::cmd("SINK.INFO").query_async(&mut conn).await?;
+            let flushed_retry = parse_info_val(&info2, "sink_writes_flushed:") - flushed_before;
+            let failures_retry = parse_info_val(&info2, "sink_write_failures:") - failures_before;
+            if failures_retry > 0 {
+                let detail = format!(
+                    "write_failures={} (flushed={})",
+                    failures_retry, flushed_retry,
+                );
+                println!("      FAIL: {}", detail);
+                results.push((test_cfg.name, false, detail));
+                println!();
+                continue;
+            }
+            // Update with retry value
+            // (don't fail on count alone; coalescing may merge writes)
+            println!("      writes_flushed={} after retry", flushed_retry);
+        }
+
+        // Re-read final flush metrics for the detail string
+        let info_final: String = redis::cmd("SINK.INFO").query_async(&mut conn).await?;
+        let final_flushed = parse_info_val(&info_final, "sink_writes_flushed:") - flushed_before;
+
+        // Step 7: Delete all keys from Valkey (evict)
+        println!("  [6] Evicting {} keys from Valkey...", total_keys);
+        for k in &all_keys {
+            conn.del::<_, ()>(k).await?;
+        }
+
+        // Step 8: SINK.GET 5 keys (read-through test)
+        println!("  [7] SINK.GET read-through for 5 keys...");
+        for i in 0..5 {
+            let _: Option<Vec<u8>> = redis::cmd("SINK.GET")
+                .arg(&all_keys[i])
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(None);
+        }
+
+        // Step 9: Check read-through hits
+        let info_rt: String = redis::cmd("SINK.INFO").query_async(&mut conn).await?;
+        let rt_hits_now = parse_info_val(&info_rt, "sink_read_through_hits:");
+        let rt_hits = rt_hits_now - rt_hits_before;
+        println!("      read_through_hits={}", rt_hits);
+
+        // Step 10: PG verification (if applicable)
+        let mut pg_rows: Option<i64> = None;
+        if test_cfg.uses_pg && toml_cfg.postgres.enabled && !pg_verify_conn.is_empty() {
+            println!("  [8] Verifying rows in PostgreSQL ({})...", pg_verify_table);
+            match tokio_postgres::connect(pg_verify_conn, tokio_postgres::NoTls).await {
+                Ok((pg_client, pg_conn_handle)) => {
+                    tokio::spawn(async move {
+                        if let Err(e) = pg_conn_handle.await {
+                            eprintln!("      PG connection error: {}", e);
+                        }
+                    });
+                    // Count rows matching our key prefix
+                    let prefix_pattern = format!("sanity:multi:{}:%", key_prefix);
+                    let row = pg_client
+                        .query_one(
+                            &format!(
+                                "SELECT COUNT(*) FROM {} WHERE pk LIKE $1",
+                                pg_verify_table,
+                            ),
+                            &[&prefix_pattern.as_bytes()],
+                        )
+                        .await;
+                    match row {
+                        Ok(r) => {
+                            let count: i64 = r.get(0);
+                            pg_rows = Some(count);
+                            println!("      pg_rows={}", count);
+                        }
+                        Err(e) => {
+                            // pk is bytea, try a different approach: use position() or
+                            // just count all rows as a fallback
+                            println!("      PG LIKE query failed ({}), trying COUNT(*)...", e);
+                            match pg_client
+                                .query_one(
+                                    &format!("SELECT COUNT(*) FROM {}", pg_verify_table),
+                                    &[],
+                                )
+                                .await
+                            {
+                                Ok(r) => {
+                                    let count: i64 = r.get(0);
+                                    pg_rows = Some(count);
+                                    println!("      pg_rows (total)={}", count);
+                                }
+                                Err(e2) => {
+                                    println!("      PG verification failed: {}", e2);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("      PG connect failed: {}", e);
+                }
+            }
+        }
+
+        // Build detail string
+        let mut detail = format!("flushed={} rt_hits={}", final_flushed, rt_hits);
+        if let Some(rows) = pg_rows {
+            detail.push_str(&format!(" pg_rows={}", rows));
+        }
+
+        let passed = write_failures == 0 && rt_hits > 0;
+        if passed {
+            println!("  PASS: {}", detail);
+        } else {
+            println!("  FAIL: {}", detail);
+        }
+        results.push((test_cfg.name, passed, detail));
+        println!();
+    }
+
+    // -----------------------------------------------------------------------
+    // Summary table
+    // -----------------------------------------------------------------------
+    let passed_count = results.iter().filter(|(_, p, _)| *p).count();
+    let skipped_count = results.iter().filter(|(_, _, d)| d.starts_with("SKIPPED")).count();
+    let total_count = results.len();
+
+    println!("===============================================================================");
+    println!("  MULTI-CONFIG SANITY TEST RESULTS");
+    println!("===============================================================================");
+    for (name, passed, detail) in &results {
+        let status = if detail.starts_with("SKIPPED") {
+            "SKIP"
+        } else if *passed {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        println!("  {:<22} {:<6} {}", name, status, detail);
+    }
+    println!("===============================================================================");
+    if skipped_count > 0 {
+        println!(
+            "  {}/{} configs passed, {} skipped",
+            passed_count, total_count - skipped_count, skipped_count,
+        );
+    } else {
+        println!("  {}/{} configs passed", passed_count, total_count);
+    }
+    println!("===============================================================================");
+
+    if passed_count < total_count - skipped_count {
+        std::process::exit(1);
+    }
 
     Ok(())
 }
@@ -981,10 +1513,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
+    // --multi-config: run sanity checks across multiple sink configurations
+    if args.multi_config {
+        let cfg = Config::from_args_and_toml(&args, &toml_cfg);
+        return run_multi_config(&cfg, &toml_cfg).await;
+    }
+
     let cfg = Config::from_args_and_toml(&args, &toml_cfg);
+    let pg_cfg = &toml_cfg.postgres;
 
     println!("===============================================================================");
-    println!("  valkey-sink load test");
+    println!("  valkey-sink sanity test");
     println!("===============================================================================");
     println!("  target:      {}", cfg.url);
     println!(
@@ -1001,6 +1540,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if !cfg.module_args.is_empty() {
         println!("  module args: {}", cfg.module_args.join(" "));
+    }
+    if pg_cfg.enabled {
+        println!("  postgres:    enabled (table: {})", if pg_cfg.table.is_empty() { "valkey_sink" } else { &pg_cfg.table });
     }
     println!();
 
@@ -1117,11 +1659,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "  {} small (<{}->DynamoDB), {} large (>={}->S3), {} with TTL, {:.1} MB total",
+        "  {} small (below threshold), {} large (at/above threshold), {} with TTL, {:.1} MB total",
         small_count,
-        cfg.size_threshold,
         large_count,
-        cfg.size_threshold,
         ttl_count,
         total_bytes as f64 / (1024.0 * 1024.0),
     );
@@ -1143,11 +1683,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             || line.contains("coalesce")
             || line.contains("s3_writes")
             || line.contains("dynamo_writes")
+            || line.contains("pg_writes")
         {
             println!("  {}", line.trim());
         }
     }
     println!();
+
+    // =========================================================================
+    // Phase 2b: VERIFY POSTGRES (if configured)
+    // =========================================================================
+    if pg_cfg.enabled && !pg_cfg.connection_string.is_empty() {
+        let table = if pg_cfg.table.is_empty() { "valkey_sink" } else { &pg_cfg.table };
+        println!("[2b/5] POSTGRES VERIFY: checking rows in {}...", table);
+        let (pg_client, pg_conn) =
+            tokio_postgres::connect(&pg_cfg.connection_string, tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(e) = pg_conn.await {
+                eprintln!("  PG connection error: {}", e);
+            }
+        });
+
+        // Count rows
+        let row = pg_client
+            .query_one(&format!("SELECT COUNT(*) FROM {}", table), &[])
+            .await?;
+        let count: i64 = row.get(0);
+        println!("  rows in {}: {}", table, count);
+
+        // Spot-check 5 random keys
+        let mut spot_rng = rand::thread_rng();
+        let check_indices: Vec<usize> = (0..5)
+            .map(|_| spot_rng.gen_range(0..metas.len()))
+            .collect();
+        let mut found = 0;
+        for idx in &check_indices {
+            let key_bytes = metas[*idx].key.as_bytes();
+            let row = pg_client
+                .query_opt(
+                    &format!("SELECT pk, ts, ttl FROM {} WHERE pk = $1", table),
+                    &[&key_bytes],
+                )
+                .await?;
+            if row.is_some() {
+                found += 1;
+            }
+        }
+        println!(
+            "  spot-check: {}/{} keys found in PG",
+            found,
+            check_indices.len()
+        );
+        println!();
+    }
 
     // =========================================================================
     // Phase 3: EVICT — DEL all keys

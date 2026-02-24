@@ -27,15 +27,20 @@ pub struct Metrics {
     pub dynamo_write_failures: AtomicU64,
     pub dynamo_read_failures: AtomicU64,
     pub s3_read_failures: AtomicU64,
+    pub pg_writes: AtomicU64,
+    pub pg_write_failures: AtomicU64,
+    pub pg_read_failures: AtomicU64,
 
     // Latency trackers (writes)
     pub s3_latency: LatencyTracker,
     pub dynamo_latency: LatencyTracker,
+    pub pg_latency: LatencyTracker,
     pub flush_latency: LatencyTracker,
     // Latency trackers (reads)
     pub read_through_latency: LatencyTracker,
     pub s3_read_latency: LatencyTracker,
     pub dynamo_read_latency: LatencyTracker,
+    pub pg_read_latency: LatencyTracker,
 }
 
 impl Metrics {
@@ -55,12 +60,17 @@ impl Metrics {
             dynamo_write_failures: AtomicU64::new(0),
             dynamo_read_failures: AtomicU64::new(0),
             s3_read_failures: AtomicU64::new(0),
+            pg_writes: AtomicU64::new(0),
+            pg_write_failures: AtomicU64::new(0),
+            pg_read_failures: AtomicU64::new(0),
             s3_latency: LatencyTracker::new(),
             dynamo_latency: LatencyTracker::new(),
+            pg_latency: LatencyTracker::new(),
             flush_latency: LatencyTracker::new(),
             read_through_latency: LatencyTracker::new(),
             s3_read_latency: LatencyTracker::new(),
             dynamo_read_latency: LatencyTracker::new(),
+            pg_read_latency: LatencyTracker::new(),
         }
     }
 }
@@ -79,10 +89,12 @@ pub fn info_string() -> String {
     let m = get();
     let s3_lat = m.s3_latency.snapshot();
     let dynamo_lat = m.dynamo_latency.snapshot();
+    let pg_lat = m.pg_latency.snapshot();
     let flush_lat = m.flush_latency.snapshot();
     let rt_lat = m.read_through_latency.snapshot();
     let s3_read_lat = m.s3_read_latency.snapshot();
     let dynamo_read_lat = m.dynamo_read_latency.snapshot();
+    let pg_read_lat = m.pg_read_latency.snapshot();
 
     format!(
         concat!(
@@ -102,14 +114,19 @@ pub fn info_string() -> String {
             "sink_dynamo_write_failures:{}\r\n",
             "sink_dynamo_read_failures:{}\r\n",
             "sink_s3_read_failures:{}\r\n",
+            "sink_pg_writes:{}\r\n",
+            "sink_pg_write_failures:{}\r\n",
+            "sink_pg_read_failures:{}\r\n",
             "# write latency\r\n",
             "sink_s3_write_latency:{}\r\n",
             "sink_dynamo_write_latency:{}\r\n",
+            "sink_pg_write_latency:{}\r\n",
             "sink_flush_latency:{}\r\n",
             "# read latency\r\n",
             "sink_read_through_latency:{}\r\n",
             "sink_s3_read_latency:{}\r\n",
             "sink_dynamo_read_latency:{}\r\n",
+            "sink_pg_read_latency:{}\r\n",
         ),
         load(&m.writes_coalesced),
         load(&m.writes_flushed),
@@ -125,12 +142,17 @@ pub fn info_string() -> String {
         load(&m.dynamo_write_failures),
         load(&m.dynamo_read_failures),
         load(&m.s3_read_failures),
+        load(&m.pg_writes),
+        load(&m.pg_write_failures),
+        load(&m.pg_read_failures),
         s3_lat.format(),
         dynamo_lat.format(),
+        pg_lat.format(),
         flush_lat.format(),
         rt_lat.format(),
         s3_read_lat.format(),
         dynamo_read_lat.format(),
+        pg_read_lat.format(),
     )
 }
 
@@ -159,6 +181,8 @@ mod tests {
         assert!(info.contains("sink_read_through_misses:"));
         assert!(info.contains("sink_s3_write_latency:"));
         assert!(info.contains("sink_dynamo_write_latency:"));
+        assert!(info.contains("sink_pg_write_latency:"));
+        assert!(info.contains("sink_pg_writes:"));
         assert!(info.contains("sink_flush_latency:"));
     }
 

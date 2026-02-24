@@ -1,7 +1,7 @@
-# valkey-sink load test configuration
+# valkey-sink sanity test configuration
 #
 # Usage:
-#   cargo run --release -- --config loadtest.toml
+#   cargo run --release -- --config sanity-test.toml
 #
 # CLI flags override any value set here.
 
@@ -52,3 +52,9 @@ max = 4096
 # Value size range (bytes) for keys routed to S3.
 min = 65536
 max = 131072
+
+[postgres]
+# Enable PostgreSQL verification
+enabled = false
+connection_string = ""
+table = "valkey_sink"
