@@ -1191,6 +1191,22 @@ async fn run_multi_config(
             needs_aws: true,
             uses_pg: true,
         },
+        SinkTestConfig {
+            name: "dynamo-postgres",
+            module_args: vec![
+                "mode".into(), "dynamo-postgres".into(),
+                "dynamo_table".into(), dynamo_table.clone(),
+                "dynamo_region".into(), dynamo_region.clone(),
+                "pg_connection_string".into(), pg_conn.clone(),
+                "pg_table".into(), pg_table_mod.clone(),
+                "pg_pool_size".into(), pg_pool_size.clone(),
+                "pg_write_concurrency".into(), pg_write_concurrency.clone(),
+                "debounce_ms".into(), "500".into(),
+                "size_threshold".into(), "65536".into(),
+            ],
+            needs_aws: true,
+            uses_pg: true,
+        },
     ];
 
     let module_path = base_cfg.module_path.as_deref().ok_or(
